@@ -1,0 +1,557 @@
+import os
+from itertools import combinations
+import numpy as np
+import pandas as pd
+import streamlit as st
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import json
+import anthropic
+
+
+st.set_page_config(page_title="AI-Guided Regression Tool", layout="wide")
+
+# ---------- Settings ----------
+MAX_LEVELS = 15  # text columns with more levels than this are dropped by default
+STAGES = [
+    "1. Upload & Clean",
+    "2. Data Picture",
+    "3. Baseline Regression",
+    "4. Claude Suggestions",
+    "5. Pool & Search",
+    "6. Results & Export",
+]
+MODEL_BRIEF = "claude-haiku-5-5"  # switch to "claude-sonnet-5-5" for final runs
+
+# ---------- Regression functions (match Excel ToolPak layout) ----------
+def run_regression(df, y_name, x_names):
+    """Fit OLS with an intercept. Returns the statsmodels results object."""
+    X = sm.add_constant(df[x_names].astype(float))
+    y = df[y_name].astype(float)
+    return sm.OLS(y, X).fit()
+
+
+def toolpak_tables(model):
+    """Return (regression_stats, anova, coefficients) DataFrames in Excel's layout."""
+    reg = pd.DataFrame(
+        {
+            "Value": [
+                np.sqrt(model.rsquared),
+                model.rsquared,
+                model.rsquared_adj,
+                np.sqrt(model.mse_resid),
+                int(model.nobs),
+            ]
+        },
+        index=["Multiple R", "R Square", "Adjusted R Square", "Standard Error", "Observations"],
+    )
+    anova = pd.DataFrame(
+        {
+            "df": [model.df_model, model.df_resid, model.df_model + model.df_resid],
+            "SS": [model.ess, model.ssr, model.ess + model.ssr],
+            "MS": [model.ess / model.df_model, model.mse_resid, np.nan],
+            "F": [model.fvalue, np.nan, np.nan],
+            "Significance F": [model.f_pvalue, np.nan, np.nan],
+        },
+        index=["Regression", "Residual", "Total"],
+    )
+    ci = model.conf_int(alpha=0.05)
+    coef = pd.DataFrame(
+        {
+            "Coefficients": model.params,
+            "Standard Error": model.bse,
+            "t Stat": model.tvalues,
+            "P-value": model.pvalues,
+            "Lower 95%": ci[0],
+            "Upper 95%": ci[1],
+        }
+    )
+    coef.index = ["Intercept"] + list(coef.index[1:])
+    return reg, anova, coef
+
+
+# ---------- Cleaning functions ----------
+def load_file(uploaded):
+    if uploaded.name.lower().endswith(".csv"):
+        return pd.read_csv(uploaded)
+    return pd.read_excel(uploaded)
+
+
+def is_text(series):
+    return not pd.api.types.is_numeric_dtype(series)
+
+
+def flag_id_columns(df):
+    """Likely ID/label columns: all-unique integers, or names like Year/ID/Index."""
+    flagged = []
+    for c in df.columns:
+        name = str(c).lower()
+        if name in ("year", "id", "index", "date") or name.endswith("_id"):
+            flagged.append(c)
+        elif pd.api.types.is_integer_dtype(df[c]) and df[c].is_unique and len(df) > 1:
+            flagged.append(c)
+    return flagged
+
+
+def runnable_check(df):
+    """Every condition must be True before regression is allowed."""
+    numeric = all(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns)
+    checks = {"All columns numeric": numeric}
+    if numeric:
+        arr = df.to_numpy(dtype=float)
+        checks["No missing values"] = not np.isnan(arr).any()
+        checks["No infinite values"] = not np.isinf(arr).any()
+        checks["No constant columns"] = bool((df.nunique() > 1).all())
+    checks["More rows than columns"] = len(df) > df.shape[1]
+    return checks
+
+
+def clean_data(df, y_name, exclude, encode_high):
+    """Make the table regression-ready. Returns a dict with the clean table, report, and recipe."""
+    report = []
+    recipe = {"target": y_name, "excluded_by_user": list(exclude)}
+    work = df.drop(columns=list(exclude), errors="ignore").copy()
+
+    # 1. Missing/infinite Y
+    work[y_name] = work[y_name].replace([np.inf, -np.inf], np.nan)
+    n_before = len(work)
+    work = work[work[y_name].notna()]
+    recipe["rows_dropped_missing_y"] = n_before - len(work)
+    report.append(f"Dropped {n_before - len(work)} rows with missing {y_name}. {len(work):,} rows remain.")
+
+    # 2. Text columns: one-hot encode (low cardinality) or drop (high cardinality)
+    text_cols = [c for c in work.columns if c != y_name and is_text(work[c])]
+    low = [c for c in text_cols if work[c].nunique() <= MAX_LEVELS or c in encode_high]
+    high = [c for c in text_cols if c not in low]
+    work[low] = work[low].fillna("Missing").astype(str)
+    cat_original = work[low].copy()  # kept for categorical-vs-numeric charts in Tab 2
+    work = work.drop(columns=high)
+    if low:
+        work = pd.get_dummies(work, columns=low, drop_first=True, dtype=int)
+    recipe["one_hot_encoded"] = low
+    recipe["dropped_high_cardinality"] = high
+    if low:
+        report.append(f"One-hot encoded (drop_first): {', '.join(map(str, low))}.")
+    if high:
+        report.append(f"Dropped high-cardinality text columns: {', '.join(map(str, high))}.")
+
+    # 3. Booleans to 0/1, infinities to NaN, median imputation
+    for c in work.columns:
+        if pd.api.types.is_bool_dtype(work[c]):
+            work[c] = work[c].astype(int)
+    x_cols = [c for c in work.columns if c != y_name]
+    work[x_cols] = work[x_cols].replace([np.inf, -np.inf], np.nan)
+    all_nan = [c for c in x_cols if work[c].isna().all()]
+    work = work.drop(columns=all_nan)
+    x_cols = [c for c in x_cols if c not in all_nan]
+    medians = work[x_cols].median()
+    imputed = {str(c): int(work[c].isna().sum()) for c in x_cols if work[c].isna().any()}
+    work[x_cols] = work[x_cols].fillna(medians)
+    recipe["dropped_all_missing"] = all_nan
+    recipe["median_imputed_counts"] = imputed
+    if all_nan:
+        report.append(f"Dropped columns that were entirely missing: {', '.join(map(str, all_nan))}.")
+    if imputed:
+        report.append("Filled missing values with column medians: " + ", ".join(f"{k} ({v})" for k, v in imputed.items()) + ".")
+
+    # 4. Dummy pairs that always sum to 1 (keep only one)
+    binary = [c for c in x_cols if set(work[c].unique()) <= {0, 1}]
+    pair_drop = []
+    for a, b in combinations(binary, 2):
+        if a in pair_drop or b in pair_drop:
+            continue
+        if (work[a] + work[b] == 1).all():
+            pair_drop.append(b)
+    work = work.drop(columns=pair_drop)
+    x_cols = [c for c in x_cols if c not in pair_drop]
+    recipe["dropped_dummy_pair_duplicates"] = pair_drop
+    if pair_drop:
+        report.append(f"Dropped one column from each dummy pair that sums to 1: {', '.join(map(str, pair_drop))}.")
+
+    # 5. Constant columns
+    constant = [c for c in x_cols if work[c].nunique() <= 1]
+    work = work.drop(columns=constant)
+    x_cols = [c for c in x_cols if c not in constant]
+    recipe["dropped_constant"] = constant
+    if constant:
+        report.append(f"Dropped constant columns: {', '.join(map(str, constant))}.")
+
+    # 6. Perfect collinearity: keep a column only if it raises the matrix rank
+    collinear, kept = [], []
+    mat = np.ones((len(work), 1))
+    rank = 1
+    for c in x_cols:
+        v = work[c].to_numpy(dtype=float)
+        z = (v - v.mean()) / v.std()
+        trial = np.column_stack([mat, z])
+        r = np.linalg.matrix_rank(trial)
+        if r > rank:
+            mat, rank = trial, r
+            kept.append(c)
+        else:
+            collinear.append(c)
+    work = work[[y_name] + kept]
+    recipe["dropped_perfectly_collinear"] = collinear
+    if collinear:
+        report.append(f"Dropped perfectly collinear columns: {', '.join(map(str, collinear))}.")
+
+    recipe["final_columns"] = [str(c) for c in work.columns]
+    report.append(f"Final table: {len(work):,} rows, 1 target + {len(kept)} predictors.")
+    return {"df": work, "cat_original": cat_original, "report": report, "recipe": recipe}
+
+
+# ---------- Stage navigation (session state) ----------
+st.session_state.setdefault("unlocked", 0)
+st.session_state.setdefault("stage_nav", STAGES[0])
+st.session_state.setdefault("clean", None)
+st.session_state.setdefault("brief", None)
+st.session_state.setdefault("base_model", None)
+
+
+def reset_state():
+    """Runs when a new file is uploaded or removed."""
+    st.session_state.unlocked = 0
+    st.session_state.stage_nav = STAGES[0]
+    st.session_state.clean = None
+    st.session_state.brief = None
+    st.session_state.base_model = None
+    st.session_state.pop("base_x", None)
+
+
+def approve_stage(i):
+    """Unlock and jump to the next stage."""
+    st.session_state.unlocked = max(st.session_state.unlocked, i + 1)
+    st.session_state.stage_nav = STAGES[i + 1]
+
+
+# ---------- Stage 1 ----------
+def show_stage_1():
+    uploaded = st.file_uploader("Upload a .csv or .xlsx file", type=["csv", "xlsx"], on_change=reset_state)
+    if uploaded is None:
+        return
+    df = load_file(uploaded)
+    st.write(f"Loaded {len(df):,} rows and {df.shape[1]} columns.")
+    st.dataframe(df.head(10), use_container_width=True)
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    if not numeric_cols:
+        st.error("No numeric columns found, so there is no valid target variable.")
+        return
+    y_name = st.selectbox("Target variable (Y)", numeric_cols)
+    others = [c for c in df.columns if c != y_name]
+    flagged = [c for c in flag_id_columns(df) if c != y_name]
+    exclude = st.multiselect("Columns to exclude (likely ID/label columns are pre-selected)", others, default=flagged)
+
+    high = [c for c in others if c not in exclude and is_text(df[c]) and df[c].nunique() > MAX_LEVELS]
+    encode_high = []
+    if high:
+        encode_high = st.multiselect(
+            f"Text columns with more than {MAX_LEVELS} levels are dropped by default. Pick any to one-hot encode anyway (adds many columns):",
+            high,
+        )
+
+    if st.button("Run cleaning", type="primary"):
+        st.session_state.clean = clean_data(df, y_name, exclude, encode_high)
+        st.session_state.brief = None
+        st.session_state.base_model = None
+        st.session_state.pop("base_x", None)
+
+    result = st.session_state.clean
+    if result is None:
+        return
+
+    st.subheader("Cleaning report")
+    st.markdown("\n".join(f"- {line}" for line in result["report"]))
+    st.dataframe(result["df"].head(10), use_container_width=True)
+
+    checks = runnable_check(result["df"])
+    st.subheader("Runnable-table checks")
+    for name, ok in checks.items():
+        st.write(("✅ " if ok else "❌ ") + name)
+    with st.expander("Model recipe so far"):
+        st.json(result["recipe"])
+
+    st.button(
+        "Approve cleaned data →",
+        on_click=approve_stage,
+        args=(0,),
+        disabled=not all(checks.values()),
+    )
+
+# ---------- Profile functions ----------
+DESC_LABELS = [
+    "Mean", "Standard Error", "Median", "Mode", "Standard Deviation", "Sample Variance",
+    "Kurtosis", "Skewness", "Range", "Minimum", "Maximum", "Sum", "Count",
+]
+
+
+def descriptive_stats(df):
+    """Excel Descriptive Statistics layout. Mode is NaN when no value repeats (Excel shows #N/A)."""
+    cols = {}
+    for c in df.columns:
+        s = df[c].astype(float)
+        counts = s.value_counts()
+        if counts.max() > 1:
+            tied = counts[counts == counts.max()].index
+            mode = s[s.isin(tied)].iloc[0]  # first one appearing in the data, like Excel
+        else:
+            mode = np.nan
+        cols[c] = [
+            s.mean(), s.std() / np.sqrt(len(s)), s.median(), mode, s.std(), s.var(),
+            s.kurt(), s.skew(), s.max() - s.min(), s.min(), s.max(), s.sum(), s.count(),
+        ]
+    return pd.DataFrame(cols, index=DESC_LABELS)
+
+
+def compute_vif(df, x_cols):
+    """Variance inflation factor for each predictor (constant added, then skipped)."""
+    X = sm.add_constant(df[x_cols].astype(float)).to_numpy()
+    out = {}
+    for i, c in enumerate(x_cols, start=1):
+        try:
+            out[c] = variance_inflation_factor(X, i)
+        except Exception:
+            out[c] = np.inf
+    return pd.Series(out)
+
+
+def hist_fig(series, title):
+    fig, ax = plt.subplots(figsize=(5, 3.2))
+    ax.hist(series.dropna(), bins=30, color="#4C78A8", edgecolor="white")
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def scatter_fig(df, x, y):
+    fig, ax = plt.subplots(figsize=(5, 3.2))
+    ax.scatter(df[x], df[y], s=8, alpha=0.4, color="#4C78A8")
+    slope, intercept = np.polyfit(df[x], df[y], 1)
+    xs = np.linspace(df[x].min(), df[x].max(), 50)
+    ax.plot(xs, slope * xs + intercept, color="#E45756")
+    ax.set_xlabel(str(x))
+    ax.set_ylabel(str(y))
+    fig.tight_layout()
+    return fig
+
+
+def heatmap_fig(corr):
+    n = len(corr)
+    size = min(14, max(6, n * 0.45))
+    fig, ax = plt.subplots(figsize=(size, size * 0.85))
+    im = ax.imshow(corr.to_numpy(), cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(corr.columns, rotation=90, fontsize=7)
+    ax.set_yticklabels(corr.index, fontsize=7)
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    return fig
+
+
+def box_fig(cat, y_values, cat_name, y_name):
+    groups = [y_values[cat == lvl] for lvl in sorted(cat.unique())]
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    ax.boxplot(groups, tick_labels=sorted(cat.unique()))
+    ax.set_title(f"{y_name} by {cat_name}")
+    ax.tick_params(axis="x", rotation=45, labelsize=8)
+    fig.tight_layout()
+    return fig
+
+# ---------- Claude brief + Base Data Model ----------
+def get_api_key():
+    """Sidebar password box first, then environment variable."""
+    typed = st.sidebar.text_input("Anthropic API key", type="password")
+    return typed or os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def num(v, digits=3):
+    """JSON-safe number (no NaN or infinity)."""
+    return round(float(np.nan_to_num(v, nan=0.0, posinf=1e6, neginf=-1e6)), digits)
+
+
+def build_profile(df, recipe, summary, corr, cat_original):
+    """Compact numeric profile for Claude. No raw rows are ever included."""
+    y = recipe["target"]
+    x_cols = [c for c in df.columns if c != y]
+    pairs = []
+    for a, b in combinations(x_cols, 2):
+        if abs(corr.loc[a, b]) > 0.8:
+            pairs.append({"a": str(a), "b": str(b), "r": num(corr.loc[a, b])})
+    pairs = sorted(pairs, key=lambda p: -abs(p["r"]))[:10]
+
+    categorical = {}
+    for c in cat_original.columns:
+        g = df[y].groupby(cat_original[c]).agg(["mean", "count"])
+        categorical[str(c)] = {str(k): {"mean_y": num(r["mean"]), "n": int(r["count"])} for k, r in g.iterrows()}
+
+    return {
+        "target": str(y),
+        "rows": int(len(df)),
+        "n_predictors": len(x_cols),
+        "target_summary": {
+            "mean": num(df[y].mean()), "sd": num(df[y].std()),
+            "min": num(df[y].min()), "max": num(df[y].max()), "skew": num(df[y].skew()),
+        },
+        "predictors_by_abs_corr_with_y": [
+            {"name": str(c), "corr_y": num(r["Corr with Y"]), "skew": num(r["Skew"]), "vif": num(r["VIF"], 1)}
+            for c, r in summary.head(25).iterrows()
+        ],
+        "high_vif_over_10": [str(c) for c in summary.index[summary["VIF"] > 10]],
+        "highly_correlated_predictor_pairs": pairs,
+        "categorical_y_means": categorical,
+        "dropped_high_cardinality_text": [str(c) for c in recipe["dropped_high_cardinality"]],
+        "cleaning_recipe": {k: v for k, v in recipe.items() if k != "final_columns"},
+    }
+
+
+BRIEF_SYSTEM = (
+    "You are a statistics tutor helping an introductory college statistics student. "
+    "You receive a compact JSON profile of a cleaned dataset prepared for multiple linear regression. "
+    "Write a plain-English brief with these short sections: "
+    "1) Key relationships with the target (numeric and categorical), "
+    "2) Anomalies or oddities, 3) Skew and possible log transforms, "
+    "4) Collinearity concerns and which variables to consider dropping or combining, "
+    "5) Possible panel or time-series issues, 6) Which charts to look at first, "
+    "7) Whether the table looks safe to regress. "
+    "Be concise, use only the numbers provided, and do not invent facts about the data."
+)
+
+
+def ask_claude_brief(profile, api_key):
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model=MODEL_BRIEF,
+        max_tokens=10000,
+        system=BRIEF_SYSTEM,
+        messages=[{"role": "user", "content": json.dumps(profile)}],
+    )
+    text = "".join(b.text for b in msg.content if b.type == "text")
+    if not text:
+        raise ValueError(f"Claude returned no text (stop reason: {msg.stop_reason}).")
+    return text
+
+
+def approve_base_model():
+    """Save the Base Data Model choices to the recipe and unlock Stage 3."""
+    keep = list(st.session_state.base_x)
+    result = st.session_state.clean
+    st.session_state.base_model = {"target": result["recipe"]["target"], "x_cols": keep}
+    result["recipe"]["base_model_columns"] = keep
+    approve_stage(1)
+
+# ---------- Stage 2 ----------
+def show_stage_2():
+    result = st.session_state.clean
+    df, recipe = result["df"], result["recipe"]
+    y = recipe["target"]
+    x_cols = [c for c in df.columns if c != y]
+
+    corr = df.corr()
+    summary = pd.DataFrame(
+        {
+            "Corr with Y": corr[y].drop(y),
+            "Skew": df[x_cols].skew(),
+            "VIF": compute_vif(df, x_cols),
+        }
+    ).sort_values("Corr with Y", key=abs, ascending=False)
+
+    st.subheader("Variable summary")
+    st.caption("Sorted by strength of correlation with Y. VIF above 10 suggests collinearity. Absolute skew above 1 suggests a log transform may help.")
+    st.dataframe(
+        summary.style.format({"Corr with Y": "{:.3f}", "Skew": "{:.2f}", "VIF": "{:.1f}"}),
+        use_container_width=True,
+    )
+    high_vif = summary.index[summary["VIF"] > 10].tolist()
+    skewed = summary.index[summary["Skew"].abs() > 1].tolist()
+    if high_vif:
+        st.warning("High VIF (above 10): " + ", ".join(map(str, high_vif)))
+    if skewed:
+        st.info("Strongly skewed (|skew| above 1): " + ", ".join(map(str, skewed)))
+    if recipe["dropped_high_cardinality"]:
+        st.info(
+            "Possible panel data: high-cardinality text column(s) "
+            + ", ".join(map(str, recipe["dropped_high_cardinality"]))
+            + " were dropped. If these identify repeated entities (such as a country observed many times), "
+            "rows are not independent, which breaks a core regression assumption. Interpret p-values with caution."
+        )
+
+    st.subheader("Charts")
+    top = summary.index[:4].tolist()
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = hist_fig(df[y], f"Distribution of {y}")
+        st.pyplot(fig)
+        plt.close(fig)
+    with c2:
+        picked = st.selectbox("Histogram of predictor", x_cols, index=x_cols.index(top[0]))
+        fig = hist_fig(df[picked], f"Distribution of {picked}")
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.markdown("**Strongest predictors vs Y**")
+    cols = st.columns(2)
+    for i, c in enumerate(top):
+        with cols[i % 2]:
+            fig = scatter_fig(df, c, y)
+            st.pyplot(fig)
+            plt.close(fig)
+
+    st.markdown("**Correlation heatmap**")
+    fig = heatmap_fig(df.corr())
+    st.pyplot(fig)
+    plt.close(fig)
+
+    cat = result["cat_original"]
+    if cat.shape[1] > 0:
+        st.markdown("**Y by category**")
+        for c in cat.columns:
+            fig = box_fig(cat[c], df[y], c, y)
+            st.pyplot(fig)
+            plt.close(fig)
+
+    with st.expander("Show Class Math & Descriptive Stats"):
+        st.markdown("**Descriptive statistics (Excel layout)**")
+        st.dataframe(descriptive_stats(df).style.format("{:,.4f}", na_rep="#N/A"), use_container_width=True)
+        st.markdown("**Correlation matrix (Pearson)**")
+        st.dataframe(corr.style.format("{:.3f}"), use_container_width=True)
+
+    st.divider()
+    st.subheader("Claude's brief")
+    api_key = get_api_key()
+    profile = build_profile(df, recipe, summary, corr, result["cat_original"])
+    if not api_key:
+        st.caption("Enter your API key in the sidebar to enable the brief.")
+    if st.button("Generate Claude brief", disabled=not api_key):
+        with st.spinner("Claude is reading the profile..."):
+            try:
+                st.session_state.brief = ask_claude_brief(profile, api_key)
+            except Exception as e:
+                st.error(f"Claude call failed: {e}")
+    if st.session_state.brief:
+        st.markdown(st.session_state.brief)
+    with st.expander("Exactly what Claude was sent"):
+        st.json(profile)
+
+    st.divider()
+    st.subheader("Base Data Model")
+    st.write(f"Target (Y): **{y}**")
+    st.multiselect("Predictors to keep", x_cols, default=x_cols, key="base_x")
+    st.button(
+        "Approve Base Data Model →",
+        on_click=approve_base_model,
+        disabled=len(st.session_state.get("base_x", x_cols)) == 0,
+    )
+    
+
+# ---------- Main ----------
+st.title("AI-Guided Multiple Regression Tool")
+st.radio("Stage", STAGES[: st.session_state.unlocked + 1], key="stage_nav", horizontal=True)
+
+if st.session_state.stage_nav == STAGES[0]:
+    show_stage_1()
+elif st.session_state.stage_nav == STAGES[1]:
+    show_stage_2()
+else:
+    st.info("This stage is built in a later step.")
