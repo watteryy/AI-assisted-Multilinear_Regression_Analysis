@@ -1,11 +1,11 @@
 import os
+import warnings
 from itertools import combinations
 import numpy as np
 import pandas as pd
 import streamlit as st
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
-from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.diagnostic import het_breuschpagan, linear_reset
 from statsmodels.stats.stattools import durbin_watson
 import json
@@ -26,7 +26,7 @@ st.set_page_config(page_title="AI-Guided Regression Tool", layout="wide")
 # ---------- Settings ----------
 MAX_LEVELS = 15  # text columns with more levels than this are dropped by default
 STAGES = [
-    "1. Upload & Complete",
+    "1. Data Audit & Prep",
     "2. Data Picture",
     "3. Baseline Regression",
     "4. Claude Suggestions",
@@ -85,12 +85,6 @@ def toolpak_tables(model):
 
 
 # ---------- Cleaning functions ----------
-def load_file(uploaded):
-    if uploaded.name.lower().endswith(".csv"):
-        return pd.read_csv(uploaded)
-    return pd.read_excel(uploaded)
-
-
 def is_text(series):
     return not pd.api.types.is_numeric_dtype(series)
 
@@ -120,10 +114,13 @@ def runnable_check(df):
     return checks
 
 
-def clean_data(df, y_name, exclude, encode_high):
-    """Make the table regression-ready. Returns a dict with the clean table, report, and recipe."""
-    report = []
+def clean_data(df, y_name, exclude, encode_high, audit=None):
+    """Make the table regression-ready. Returns a dict with the clean table, report, and recipe.
+    `audit` (optional) is the Data audit record: its auto-fixes and approved fixes lead the report."""
+    report = list(audit["auto_fixes"]) + list(audit["applied"]) if audit else []
     recipe = {"target": y_name, "excluded_by_user": list(exclude)}
+    if audit:
+        recipe["audit"] = audit
     work = df.drop(columns=list(exclude), errors="ignore").copy()
 
     # 1. Missing/infinite Y
@@ -192,15 +189,20 @@ def clean_data(df, y_name, exclude, encode_high):
 
     # 6. Perfect collinearity: keep a column only if it raises the matrix rank
     collinear, kept = [], []
-    mat = np.ones((len(work), 1))
-    rank = 1
+    n = len(work)
+    basis = np.empty((n, len(x_cols) + 1))  # orthonormal basis of the columns kept so far, starting with the intercept
+    basis[:, 0] = 1 / np.sqrt(n)
+    used = 1
     for c in x_cols:
         v = work[c].to_numpy(dtype=float)
         z = (v - v.mean()) / v.std()
-        trial = np.column_stack([mat, z])
-        r = np.linalg.matrix_rank(trial)
-        if r > rank:
-            mat, rank = trial, r
+        resid = z
+        for _ in range(2):  # twice, for numerical stability
+            resid = resid - basis[:, :used] @ (basis[:, :used].T @ resid)
+        size = np.linalg.norm(resid)
+        if size > 1e-8 * np.linalg.norm(z):  # adds a new direction, so it is not a combination of the kept columns
+            basis[:, used] = resid / size
+            used += 1
             kept.append(c)
         else:
             collinear.append(c)
@@ -213,6 +215,210 @@ def clean_data(df, y_name, exclude, encode_high):
     report.append(f"Final table: {len(work):,} rows, 1 target + {len(kept)} predictors.")
     raw = df.loc[work.index].copy()  # original columns, same rows as the cleaned table
     return {"df": work, "raw": raw, "cat_original": cat_original, "report": report, "recipe": recipe}
+
+
+# ---------- Data audit (U2) ----------
+# Prep makes the table runnable; the audit looks for errors in the data itself.
+# Safe fixes happen on load (auto_fix). Everything else is flagged with evidence and only changes if the user approves.
+MISSING_TOKENS = {"?", "n/a", "na", "n.a.", "none", "null", "nan", "-", "--", "missing", "unknown", "#n/a"}
+SENTINELS = {-99999, -9999, -999, -99, 999, 9999, 99999}   # common "no data" codes; flagged only when set apart from the rest of the column
+SUMMARY_WORDS = {"total", "world", "all", "average", "overall", "global"}
+LEAK_R = 0.98            # |correlation| with Y above this looks like leakage
+NUM_TEXT_SHARE = 0.9     # a text column converts to numbers when this share of its values parse
+
+
+def parse_number_text(s):
+    """Floats from text such as '$1,200' or '45%' (NaN where it does not parse)."""
+    return pd.to_numeric(s.astype(str).str.replace(r"[\$,%\s]", "", regex=True), errors="coerce")
+
+
+def _tokens(s):
+    """True where a text cell is a 'missing' placeholder such as ? or N/A."""
+    return s.notna() & s.astype(str).str.strip().str.lower().isin(MISSING_TOKENS)
+
+
+def auto_fix(df):
+    """Safe tidy-ups on load: trim spaces in names and text values, convert numbers stored as text. Returns (table, log)."""
+    df, log = df.copy(), []
+    renamed = {c: c.strip() for c in df.columns
+               if isinstance(c, str) and c != c.strip() and c.strip() not in df.columns}  # skip if the trimmed name already exists
+    if renamed:
+        df = df.rename(columns=renamed)
+        log.append(f"Auto-fix: trimmed spaces around {len(renamed)} column name(s).")
+    for c in [c for c in df.columns if is_text(df[c])]:
+        s = df[c]
+        trimmed = s.where(s.isna(), s.astype(str).str.strip())
+        if (trimmed != s)[s.notna()].any():
+            df[c] = s = trimmed
+            log.append(f"Auto-fix: trimmed leading and trailing spaces in the values of {c}.")
+        present = s.notna()
+        if not present.any():
+            continue
+        parsed, tok = parse_number_text(s), _tokens(s)
+        if parsed.notna().any() and (parsed.notna() | tok)[present].mean() >= NUM_TEXT_SHARE:
+            df[c] = parsed
+            extra = f"; {int(tok.sum()):,} placeholder(s) became missing" if tok.any() else ""
+            log.append(f"Auto-fix: {c} held numbers stored as text (symbols such as $ , % removed), converted to numeric{extra}.")
+    return df, log
+
+
+def audit_data(df, y_name):
+    """List of findings, most severe first. Each has evidence, a plain 'why', optional rows, and an optional fix."""
+    out = []
+
+    def add(kind, severity, title, col, evidence, why, rows=None, fix=None, fix_label=None, extra=None):
+        rows = None if rows is None else list(rows)
+        out.append({"id": f"{kind}:{col}", "kind": kind, "severity": severity, "title": title, "column": col,
+                    "evidence": evidence, "why": why, "rows": rows, "fix_label": fix_label,
+                    "fix": None if fix is None else {"type": fix, "column": col, "rows": rows, **(extra or {})}})
+
+    dup = df.duplicated()
+    if dup.any():
+        add("dup_rows", "High", f"{int(dup.sum()):,} exact duplicate row(s)", None,
+            "These rows are identical to an earlier row in every column.",
+            "Repeated rows count the same observation twice, which makes results look more certain than they are.",
+            dup[dup].index, "drop_rows", "Drop the duplicates (keep the first copy)")
+
+    for c in df.columns:
+        s = df[c]
+        if is_text(s):
+            tok = _tokens(s)
+            if tok.any():
+                seen = s[tok].astype(str).str.strip().value_counts().head(3)
+                add("missing_code", "Medium", f"{int(tok.sum()):,} placeholder(s) standing in for missing values in {c}", c,
+                    "Placeholders found: " + ", ".join(f"'{k}' x{v}" for k, v in seen.items()) + ".",
+                    "They are read as real labels, so the column would get a made-up category instead of a gap.",
+                    tok[tok].index, "to_missing", "Mark them as missing")
+            if s.nunique() <= 50:
+                raw = s.dropna().astype(str)
+                v = pd.DataFrame({"raw": raw, "key": raw.str.lower()}).drop_duplicates()
+                multi = v.groupby("key")["raw"].nunique()
+                multi = multi[multi > 1]
+                if len(multi):
+                    counts, mapping = raw.value_counts(), {}
+                    for k in multi.index:
+                        group = v.loc[v["key"] == k, "raw"].tolist()
+                        best = max(group, key=lambda x: counts[x])
+                        mapping.update({x: best for x in group if x != best})
+                    shown = "; ".join(" / ".join(repr(x) for x in v.loc[v["key"] == k, "raw"]) for k in list(multi.index)[:3])
+                    add("labels", "Low", f"{len(multi)} label(s) in {c} differ only by capitalization", c,
+                        f"Spellings seen: {shown}.",
+                        "The same category would be counted as separate levels.",
+                        s.index[s.isin(list(mapping))], "merge_labels", "Merge each into its most common spelling",
+                        {"map": mapping})
+            if s.nunique() >= 3:
+                low = s.dropna().astype(str).str.strip().str.lower()
+                hit = low.isin(SUMMARY_WORDS) | low.str.split().str[0].isin(SUMMARY_WORDS)
+                if hit.any() and hit.mean() < 0.2:
+                    add("summary_rows", "Medium", f"{int(hit.sum()):,} row(s) in {c} look like totals or averages", c,
+                        "Labels such as total, world, all, average or overall appear among the entity labels.",
+                        "A summary row duplicates the rows it summarizes, so it can distort every coefficient.",
+                        hit[hit].index)
+        else:
+            vals = s.dropna()
+            if vals.empty or s.nunique() <= 2:
+                continue
+            def set_apart(v):
+                """A code sits at the edge of the column, with a gap to the other values of more than 2 SDs of those values."""
+                rest = vals[vals != v]
+                if rest.empty or v not in (vals.min(), vals.max()):
+                    return False
+                edge = rest.max() if v > rest.max() else rest.min()
+                return abs(v - edge) > 2 * rest.std()
+            sent = [v for v in SENTINELS if int((s == v).sum()) >= 2 and set_apart(v)]
+            if sent:
+                hit = s.isin(sent)
+                rest = s[~hit]
+                add("missing_code", "Medium", f"{int(hit.sum()):,} value(s) in {c} look like a missing-data code", c,
+                    f"The value {sent[0]:g} repeats {int((s == sent[0]).sum()):,} times at the edge of the column; "
+                    f"the other values range from {rest.min():g} to {rest.max():g}.",
+                    "A code like this is read as a real number, so it can pull the whole fit.",
+                    hit[hit].index, "to_missing", "Mark them as missing")
+                continue
+            neg = s < 0
+            if neg.any() and (vals % 1 == 0).all() and (vals >= 0).mean() >= 0.95:
+                add("negative", "Medium", f"{int(neg.sum()):,} negative value(s) in {c}, which otherwise looks like a count", c,
+                    f"The lowest value is {vals.min():g}.", "A count cannot be negative, so these may be entry errors.", neg[neg].index)
+            inside = ((vals >= 0) & (vals <= 100)).mean()
+            if 0.99 <= inside < 1 and vals.nunique() > 5 and vals.max() <= 200:
+                bad = (s < 0) | (s > 100)
+                add("out_of_range", "Medium", f"{int(bad.sum()):,} value(s) in {c} outside 0 to 100, though most sit inside it", c,
+                    f"Values run from {vals.min():g} to {vals.max():g}.",
+                    "If this column is a percentage or share, values outside 0 to 100 are impossible.", bad[bad].index)
+
+    if y_name in df.columns:
+        r = df.select_dtypes("number").drop(columns=[y_name], errors="ignore").corrwith(df[y_name]).abs()
+        for c in r.index[r > LEAK_R]:
+            add("leakage", "High", f"{c} is almost a copy of {y_name} (|r| = {r[c]:.3f})", c,
+                f"The correlation between {c} and {y_name} is {r[c]:.3f}.",
+                "A predictor that nearly equals Y often comes from the same source or is computed from it, so the fit looks perfect without being useful.")
+
+    exact = df.duplicated(keep=False)
+    times = [c for c in df.columns if c != y_name and not is_text(df[c]) and 3 <= df[c].nunique() <= 200
+             and (df[c].dropna() % 1 == 0).all() and df[c].max() - df[c].min() + 1 <= 1.5 * df[c].nunique()]
+    for e in entity_candidates(df, 3)[:3]:
+        for t in times[:5]:
+            pair = df.duplicated([e, t], keep=False)
+            rep = pair & ~exact
+            if rep.any() and pair.mean() < 0.1:  # a real key is mostly unique; a heavily repeated pair is just a grouping
+                add("dup_keys", "Medium", f"{int(rep.sum()):,} rows share the same {e} and {t} but hold different values", f"{e}+{t}",
+                    f"Each {e} and {t} pair should appear once if {t} is a time period, but these pairs repeat.",
+                    "Repeated keys can mean double entries or a missing grouping column, so rows are not independent.", rep[rep].index)
+                break
+
+    out.sort(key=lambda f: {"High": 0, "Medium": 1, "Low": 2}[f["severity"]])
+    return out
+
+
+def apply_audit(df, findings, decisions):
+    """Apply only the fixes the user approved. Returns (table, log of what was applied)."""
+    df, applied, drop = df.copy(), [], set()
+    for f in findings:
+        fx = f["fix"]
+        if not fx or not decisions.get(f["id"]):
+            continue
+        t, c, rows = fx["type"], fx["column"], fx["rows"]
+        if t == "to_missing":
+            if not is_text(df[c]):
+                df[c] = df[c].astype(float)
+            df.loc[rows, c] = np.nan
+            applied.append(f"Audit fix: marked {len(rows):,} value(s) in {c} as missing.")
+        elif t == "merge_labels":
+            df[c] = df[c].replace(fx["map"])
+            applied.append(f"Audit fix: merged {len(fx['map'])} label spelling(s) in {c}.")
+        elif t == "drop_rows":
+            drop.update(rows)
+    if drop:
+        df = df.drop(index=list(drop))
+        applied.append(f"Audit fix: dropped {len(drop):,} duplicate row(s).")
+    return df, applied
+
+
+@st.cache_data(show_spinner=False)
+def prepare_upload(name, data):
+    """Read and tidy the uploaded file once per file (Streamlit reruns the script on every click)."""
+    buf = io.BytesIO(data)
+    return auto_fix(pd.read_csv(buf) if name.lower().endswith(".csv") else pd.read_excel(buf))
+
+
+audit_cached = st.cache_data(show_spinner=False)(audit_data)  # recomputed only when the table or the target changes
+
+
+def audit_record(auto_log, findings, decisions):
+    """What goes into recipe['audit']: auto-fixes, every finding with its decision. Filled with 'applied' after apply_audit."""
+    status = lambda f: "flag only" if not f["fix"] else ("fix applied" if decisions.get(f["id"]) else "left as is")
+    return {"auto_fixes": list(auto_log), "applied": [],
+            "findings": [{"severity": f["severity"], "title": f["title"], "evidence": f["evidence"], "decision": status(f)}
+                         for f in findings]}
+
+
+def audit_lines(au):
+    """One-line summaries for the report and Excel. No cell values, so they are safe to send to Claude."""
+    if not au:
+        return ["No audit was recorded."]
+    lines = list(au["auto_fixes"]) + list(au["applied"])
+    lines += [f"[{f['severity']}] {f['title']}: {f['decision']}" for f in au["findings"]]
+    return lines or ["The audit found nothing to flag."]
 
 
 # ---------- Stage navigation (session state) ----------
@@ -238,6 +444,8 @@ def reset_state():
     for k in NOTE_KEYS:
         st.session_state.pop(k, None)
     st.session_state.pop("seg_brief", None)
+    for k in [k for k in st.session_state if str(k).startswith("audit_")]:
+        st.session_state.pop(k)  # audit decision radios from the previous file
     st.session_state.baseline_brief = None
     reset_features()
 
@@ -275,7 +483,7 @@ def show_stage_1():
     if uploaded is None:
         ui.first_look_hint()
         return
-    df = load_file(uploaded)
+    df, auto_log = prepare_upload(uploaded.name, uploaded.getvalue())
 
     # --- Headline strip: what did we just load? ---
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
@@ -293,12 +501,11 @@ def show_stage_1():
         ("Missing cells", f"{pct_missing:.1f}%", f"{int(miss.sum()):,} empty cells across {len(miss)} column(s)."),
     ])
     with st.expander("Preview the first 10 rows"):
-        st.dataframe(df.head(10), use_container_width=True)
+        st.dataframe(df.head(10))
     if len(miss):
         with st.expander(f"Which columns have gaps? ({len(miss)})"):
             st.dataframe(
                 pd.DataFrame({"Missing": miss, "Percent": miss / len(df) * 100}).style.format({"Missing": "{:,.0f}", "Percent": "{:.1f}%"}),
-                use_container_width=True,
             )
 
     # --- Setup: two controls side by side ---
@@ -321,8 +528,43 @@ def show_stage_1():
                        "Pick any below to one-hot encode anyway (adds many columns).")
             encode_high = st.multiselect("One-hot encode anyway", high)
 
+    # --- Data audit: errors in the data itself ---
+    st.divider()
+    ui.section("Data audit", "Looks for errors in the data itself, not just gaps. Nothing changes unless you pick a fix; every choice is logged in the recipe.")
+    findings = audit_cached(df, y_name)
+    n_dup = int(df.duplicated().sum())
+    cols_hit = {f["column"] for f in findings if f["column"]}
+    ui.metric_strip([
+        ("Rows", f"{len(df):,}"),
+        ("Exact duplicates", f"{n_dup:,}", "Rows identical to an earlier row in every column."),
+        ("Findings", f"{len(findings)}", f"Things worth a look, involving {len(cols_hit)} column(s) by name."),
+        ("Auto-fixes applied", f"{len(auto_log)}", "Safe tidy-ups done on load: trimmed spaces, numbers stored as text."),
+    ])
+    if auto_log:
+        with st.expander("Automatic tidy-ups already applied"):
+            st.markdown("\n".join(f"- {t}" for t in auto_log))
+    if not findings:
+        st.success("No data errors flagged by the automatic checks.")
+    decisions = {}
+    for f in findings:
+        with st.container(border=True):
+            st.markdown(f":orange[●] **{f['title']}**  ·  {f['severity']}")
+            st.caption(f["evidence"] + " " + f["why"])
+            if f["fix"]:
+                choice = st.radio(f"Decision: {f['title']}", ["Leave as is", f["fix_label"]], key=f"audit_{f['id']}",
+                                  horizontal=True, label_visibility="collapsed")
+                decisions[f["id"]] = choice != "Leave as is"
+            else:
+                st.caption("Flag only: the app does not change this. Decide whether to exclude or fix it in your source file.")
+            if f["rows"]:
+                with st.expander(f"See the rows ({len(f['rows']):,}; first 10 shown)"):
+                    st.dataframe(df.loc[f["rows"][:10]])
+
     if st.button("Run Completeness Check", type="primary"):
-        st.session_state.clean = clean_data(df, y_name, exclude, encode_high)
+        fixed, applied = apply_audit(df, findings, decisions)
+        audit = audit_record(auto_log, findings, decisions)
+        audit["applied"] = applied
+        st.session_state.clean = clean_data(fixed, y_name, exclude, encode_high, audit)
         st.session_state.brief = None
         st.session_state.base_model = None
         st.session_state.pop("base_x", None)
@@ -357,7 +599,7 @@ def show_stage_1():
     with st.expander("What changed, step by step"):
         st.markdown("\n".join(f"- {line}" for line in result["report"]))
     with st.expander("Preview the cleaned table"):
-        st.dataframe(clean_df.head(10), use_container_width=True)
+        st.dataframe(clean_df.head(10))
 
     notes_box("Analyst notes (anything you noticed about the raw data or cleaning)", "notes_stage1")
     with st.expander("Model recipe so far"):
@@ -399,15 +641,18 @@ def descriptive_stats(df):
 
 
 def compute_vif(df, x_cols):
-    """Variance inflation factor for each predictor (constant added, then skipped)."""
-    X = sm.add_constant(df[x_cols].astype(float)).to_numpy()
-    out = {}
-    for i, c in enumerate(x_cols, start=1):
-        try:
-            out[c] = variance_inflation_factor(X, i)
-        except Exception:
-            out[c] = np.inf
-    return pd.Series(out)
+    """Variance inflation factor for each predictor. VIF is the diagonal of the inverse correlation matrix,
+    so one matrix inverse replaces one regression per column (same numbers, much faster on big tables)."""
+    X = df[x_cols].to_numpy(dtype=float)
+    if X.shape[1] == 1:
+        return pd.Series([1.0], index=x_cols)
+    try:
+        with np.errstate(all="ignore"):
+            vif = np.diag(np.linalg.inv(np.corrcoef(X, rowvar=False)))
+        vif = np.where(np.isfinite(vif) & (vif > 0), vif, np.inf)
+    except np.linalg.LinAlgError:  # singular: perfect collinearity
+        vif = np.full(X.shape[1], np.inf)
+    return pd.Series(vif, index=x_cols)
 
 
 def hist_fig(series, title):
@@ -524,7 +769,8 @@ def build_profile(df, recipe, summary, corr, cat_original):
         "highly_correlated_predictor_pairs": pairs,
         "categorical_y_means": categorical,
         "dropped_high_cardinality_text": [str(c) for c in recipe["dropped_high_cardinality"]],
-        "cleaning_recipe": {k: v for k, v in recipe.items() if k != "final_columns"},
+        "ranked_findings": recipe.get("data_picture", []),
+        "cleaning_recipe": {k: v for k, v in recipe.items() if k not in ("final_columns", "audit", "data_picture")},  # audit evidence can hold cell values
     }
 
 
@@ -539,12 +785,13 @@ BRIEF_SYSTEM = (
     "6) Which charts to look at first, "
     "7) Whether the table looks safe to regress. "
     "8) suggest 1 or at most 4 interesting interactions with the data, ie: varible that splits the data in two might offer an intersting take away"
+    "ranked_findings are Python's own checks, most severe first: build the brief around them. "
     "Be concise, use only the numbers provided, and do not invent facts about the data."
 )
 
 
 def ask_claude_brief(profile, api_key, system=BRIEF_SYSTEM, teach=True):
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=120.0, max_retries=2)
     msg = client.messages.create(
         model=MODEL_BRIEF,
         max_tokens=10000,
@@ -720,8 +967,25 @@ def build_segment_profile(cur, summary, corr, recipe, cands):
     }
 
 
-def run_split(col, median_split):
-    """Button callback: remember the current split and count it once in the recipe."""
+def split_is_median(raw, col):
+    """Many-valued numeric columns are always split at the median; 3+ valued ones use the user's checkbox."""
+    if is_text(raw[col]):
+        return False
+    n = raw[col].nunique()
+    if n > MAX_LEVELS:
+        return True
+    return n > 2 and bool(st.session_state.get(f"seg_median_{col}", False))
+
+
+def run_split():
+    """Button callback: remember the current split and count it once in the recipe.
+    Reads the widgets from session state at click time. Arguments bound at render time can be stale when the
+    user changes the column and clicks before the slow Stage 2 rerun finishes, which loaded the old column."""
+    raw = st.session_state.clean["raw"]
+    col = st.session_state.get("seg_col")
+    if col not in raw.columns:
+        return
+    median_split = split_is_median(raw, col)
     st.session_state.seg_current = {"col": col, "median": median_split}
     label = split_label(col, median_split)
     explored = st.session_state.clean["recipe"].setdefault("splits_explored", [])
@@ -752,7 +1016,7 @@ def show_segment_explorer(result):
             median = st.checkbox("Median split instead of one group per value", key=f"seg_median_{col}")
         else:
             median = False
-    st.button("Compare groups", on_click=run_split, args=(col, median), type="primary")
+    st.button("Compare groups", on_click=run_split, type="primary")
 
     cur = st.session_state.get("seg_current")
     if cur is None or cur["col"] not in raw.columns:
@@ -780,7 +1044,6 @@ def show_segment_explorer(result):
     st.markdown(f"**Groups by {cur['col']}**")
     st.dataframe(
         summary.style.format({"n": "{:,.0f}", "Mean of Y": "{:.3f}", "SD of Y": "{:.3f}"}),
-        use_container_width=True,
     )
     if small:
         st.warning(f"Small group(s) (under {SMALL_GROUP} rows), so correlations here are unreliable: " + ", ".join(map(str, small)))
@@ -791,7 +1054,6 @@ def show_segment_explorer(result):
     st.markdown("**Correlation of each predictor with Y, by group** (largest gaps first)")
     st.dataframe(
         corr.style.format("{:.3f}", na_rep="n/a").background_gradient(subset=["Gap"], cmap="Oranges"),
-        use_container_width=True,
     )
     st.caption("A big gap means the predictor relates to Y differently in the groups. Treat it as a hypothesis, not a proven finding.")
 
@@ -818,13 +1080,12 @@ def show_segment_explorer(result):
         if st.checkbox("Run it (all cleaned predictors)", key="seg_reg"):
             coef, pval, gstats = group_regressions(df, y, x_cols, groups)
             st.markdown("**Coefficients by group**")
-            st.dataframe(coef.style.format("{:.4f}", na_rep="n/a"), use_container_width=True)
+            st.dataframe(coef.style.format("{:.4f}", na_rep="n/a"))
             st.dataframe(
                 gstats.style.format({"n": "{:,.0f}", "Predictors used": "{:.0f}", "R Square": "{:.3f}", "Adjusted R Square": "{:.3f}"}, na_rep="n/a"),
-                use_container_width=True,
             )
             st.markdown("**P-values by group**")
-            st.dataframe(pval.style.format("{:.4f}", na_rep="n/a"), use_container_width=True)
+            st.dataframe(pval.style.format("{:.4f}", na_rep="n/a"))
             st.caption("n/a means the predictor did not vary inside that group, or the group was too small to fit. Coefficients are in each predictor's own units, so compare sign and size across groups for the same predictor.")
 
     # --- Claude's read ---
@@ -852,6 +1113,255 @@ def show_segment_explorer(result):
 
 
 
+
+
+# ---------- Ranked data picture (U3-A) ----------
+# Python runs a library of checks on the cleaned table. Each one that trips gets a severity from 0 to 1,
+# a small evidence table, a plain "why", an action, and a chart that is only drawn when the user asks for it.
+TOP_FINDINGS = 5   # findings shown up front; the rest sit in an expander
+
+
+def _clip01(v):
+    return float(min(1.0, max(0.0, v)))
+
+
+def skew_fig(series, name):
+    fig, axes = plt.subplots(1, 2, figsize=(8, 3.2))
+    axes[0].hist(series, bins=30, color=ui.ACCENT, edgecolor=ui.CARD)
+    axes[0].set_title(str(name), fontsize=9)
+    axes[1].hist(np.log1p(series), bins=30, color=ui.HIGHLIGHT, edgecolor=ui.CARD)
+    axes[1].set_title(f"ln(1+{name})", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
+def curve_fig(df, x, y):
+    """X vs Y with the straight-line fit and the fit that also uses x squared."""
+    mu, sd = df[x].mean(), df[x].std()
+    z = (df[x] - mu) / sd
+    zs = np.linspace(z.min(), z.max(), 100)
+    fig, ax = plt.subplots(figsize=(5, 3.2))
+    ax.scatter(df[x], df[y], s=8, alpha=0.3, color=ui.SOFT)
+    for deg, color, label in ((1, ui.HIGHLIGHT, "Straight line"), (2, "#54A24B", "With x squared")):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # a nearly discrete predictor can trigger a harmless conditioning warning
+            fit = np.polyfit(z, df[y], deg)
+        ax.plot(mu + sd * zs, np.polyval(fit, zs), color=color, linewidth=2, label=label)
+    ax.set_xlabel(str(x))
+    ax.set_ylabel(str(y))
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
+def cooks_fig(cooks):
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    ax.vlines(range(len(cooks)), 0, cooks, color=ui.ACCENT, linewidth=0.6)
+    ax.axhline(4 / len(cooks), color=ui.HIGHLIGHT, linestyle="--", label="Rule of thumb 4/n")
+    ax.set_xlabel("Row position")
+    ax.set_ylabel("Cook's distance")
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
+def barh_fig(series, title, xlabel, top_n=10):
+    s = series.sort_values(ascending=False).head(top_n)[::-1]
+    fig, ax = plt.subplots(figsize=(6, max(2.2, 0.35 * len(s) + 1)))
+    ax.barh([str(i) for i in s.index], s.values, color=ui.ACCENT)
+    ax.set_title(title, fontsize=9)
+    ax.set_xlabel(xlabel)
+    fig.tight_layout()
+    return fig
+
+
+def picture_checks(df, y, recipe, raw):
+    """Checks on the cleaned table, most severe first. Dataset-agnostic: nothing here looks at column names."""
+    x_cols = [c for c in df.columns if c != y]
+    X, yv = df[x_cols], df[y]
+    nonbin = [c for c in x_cols if df[c].nunique() > 2]
+    corr_y = X.corrwith(yv).fillna(0)
+    n, out = len(df), []
+
+    def add(key, title, severity, headline, evidence, fmt, why, action, chart=None):
+        if severity > 0:
+            out.append({"key": key, "title": title, "severity": _clip01(severity), "headline": headline,
+                        "evidence": evidence, "fmt": fmt, "why": why, "action": action, "chart": chart})
+
+    # 1. Skew, ranked by impact: how much ln(1+x) would improve the link with Y (skew alone does not matter much)
+    skewed = [c for c in nonbin if abs(df[c].skew()) > 1 and df[c].min() > -1]
+    if skewed:
+        rows = []
+        for c in skewed:
+            r_log = abs(np.nan_to_num(np.corrcoef(np.log1p(df[c]), yv)[0, 1]))
+            rows.append({"Predictor": c, "Skew": df[c].skew(), "|r| with Y": abs(corr_y[c]),
+                         "|r| after ln(1+x)": r_log, "Gain": r_log - abs(corr_y[c])})
+        ev = pd.DataFrame(rows).set_index("Predictor").sort_values("Gain", ascending=False)
+        g, top = float(ev["Gain"].iloc[0]), ev.index[0]
+        add("skew", "Skewed predictors", _clip01(g / 0.3) if g > 0 else 0.1,
+            f"{len(skewed)} predictor(s) are strongly skewed; a log helps most for **{top}** (|r| with Y {ev.loc[top, '|r| with Y']:.2f} to {ev.loc[top, '|r| after ln(1+x)']:.2f}).",
+            ev.head(8), {c: "{:.3f}" for c in ev.columns},
+            "A long tail lets a few huge values steer the fit and can bend the link with Y. Ranked by how much a log would improve the link, not by skew alone.",
+            "Try ln(1+x) for the top rows in Stage 4. Regression assumes roughly normal residuals, not normal predictors.",
+            lambda top=top: skew_fig(df[top], top))
+
+    # 2. Collinearity: VIF and near-duplicate pairs
+    if len(x_cols) > 1:
+        vif = compute_vif(df, x_cols)
+        high = vif[vif > 10].sort_values(ascending=False)
+        if len(high):
+            cm = X.corr()
+            absc = cm.abs().where(~np.eye(len(x_cols), dtype=bool), 0)
+            rows = [{"Predictor": c, "VIF": high[c], "Closest partner": absc[c].idxmax(), "r with partner": cm.loc[c, absc[c].idxmax()]}
+                    for c in high.index[:10]]
+            a, b = np.unravel_index(np.argmax(absc.to_numpy()), absc.shape)
+            vmax = float(high.iloc[0])
+            add("collinearity", "Predictors that repeat each other", 1.0 if not np.isfinite(vmax) else math.log10(vmax) / 3,
+                f"{len(high)} predictor(s) have VIF above 10 (largest {vmax:,.0f}).",
+                pd.DataFrame(rows).set_index("Predictor"), {"VIF": "{:,.1f}", "r with partner": "{:+.3f}"},
+                "These predictors mostly repeat others, so their coefficients can swing wildly or flip sign.",
+                "Drop one of each pair in the Base Data Model, or combine them in Stage 4.",
+                lambda a=a, b=b: scatter_fig(df, x_cols[a], x_cols[b]))
+
+    # 3. Outliers and influence
+    try:
+        cooks = run_regression(df, y, x_cols).get_influence().cooks_distance[0]
+        share, mx = float((cooks > 4 / n).mean()), float(cooks.max())
+    except Exception:
+        cooks, share, mx = None, 0.0, 0.0
+    if cooks is not None and (share > 0.03 or mx > 0.5):
+        q1, q3 = X[nonbin].quantile(0.25), X[nonbin].quantile(0.75)
+        iqr = q3 - q1
+        cnt = ((X[nonbin] < q1 - 1.5 * iqr) | (X[nonbin] > q3 + 1.5 * iqr)).sum()
+        ev = pd.DataFrame({"Outliers (1.5×IQR)": cnt, "Share of rows": cnt / n}).sort_values("Outliers (1.5×IQR)", ascending=False).head(8)
+        add("outliers", "Influential rows and outliers", max(share / 0.10, mx),
+            f"{share * 100:.1f}% of rows have a Cook's distance above 4/n; the largest is {mx:.2f}.",
+            ev, {"Outliers (1.5×IQR)": "{:,.0f}", "Share of rows": "{:.1%}"},
+            "A few extreme rows can steer the coefficients. The table counts values beyond 1.5 interquartile ranges, by predictor.",
+            "Stage 3 lists the most influential rows. Check them for entry errors, then see how much the fit changes without them.",
+            lambda cooks=cooks: cooks_fig(cooks))
+
+    # 4. Curvature: does adding x squared explain more of Y than a straight line?
+    rows, ss = [], float(((yv - yv.mean()) ** 2).sum())
+    for c in nonbin:
+        if df[c].nunique() <= 5:
+            continue
+        z = (df[c] - df[c].mean()) / df[c].std()
+        r2_lin = float(corr_y[c] ** 2)
+        r2_quad = 1 - float(((yv - np.polyval(np.polyfit(z, yv, 2), z)) ** 2).sum()) / ss
+        if r2_quad - r2_lin > 0.01:
+            rows.append({"Predictor": c, "R² straight": r2_lin, "R² with square": r2_quad, "Gain": r2_quad - r2_lin})
+    if rows:
+        ev = pd.DataFrame(rows).set_index("Predictor").sort_values("Gain", ascending=False)
+        top = ev.index[0]
+        add("curvature", "Curved relationships", ev["Gain"].iloc[0] / 0.20,
+            f"{len(ev)} predictor(s) fit noticeably better with a squared term; the biggest gain is **{top}** (R² {ev.loc[top, 'R² straight']:.2f} to {ev.loc[top, 'R² with square']:.2f}).",
+            ev.head(8), {c: "{:.3f}" for c in ev.columns},
+            "A straight line misses a bend, so predictions are biased at the ends and the middle. R² here is one predictor alone against Y.",
+            "Add the square of the top predictors in Stage 4.",
+            lambda top=top: curve_fig(df, top, y))
+
+    # 5. Missingness that was filled with medians
+    filled = {c: v for c, v in recipe.get("median_imputed_counts", {}).items() if c in df.columns}
+    if filled:
+        ev = pd.DataFrame({"Filled values": pd.Series(filled)}).sort_values("Filled values", ascending=False)
+        ev["Share of rows"] = ev["Filled values"] / n
+        mxs = float(ev["Share of rows"].iloc[0])
+        if mxs > 0.05:
+            add("missing", "Values filled with medians", mxs / 0.30,
+                f"{int((ev['Share of rows'] > 0.05).sum())} predictor(s) had more than 5% of values filled; the most is **{ev.index[0]}** at {mxs:.0%}.",
+                ev.head(8), {"Filled values": "{:,.0f}", "Share of rows": "{:.1%}"},
+                "A filled value is a guess, not data. Heavily filled columns pull coefficients toward the middle and make p-values look better than they are.",
+                "Treat results for these predictors with extra caution, or exclude them in Stage 1.",
+                lambda ev=ev: barh_fig(ev["Share of rows"] * 100, "Share of rows filled", "% of rows"))
+
+    # 6. Low variance
+    rows = []
+    for c in x_cols:
+        share_top = float(df[c].value_counts(normalize=True).iloc[0])
+        if df[c].nunique() == 2 and min(share_top, 1 - share_top) < 0.02:
+            rows.append({"Predictor": c, "Most common value's share": share_top, "Why": "almost all rows are the same 0/1 value"})
+        elif df[c].nunique() > 2 and share_top > 0.9:
+            rows.append({"Predictor": c, "Most common value's share": share_top, "Why": "one value covers over 90% of rows"})
+    if rows:
+        ev = pd.DataFrame(rows).set_index("Predictor").sort_values("Most common value's share", ascending=False)
+        add("lowvar", "Predictors that barely vary", 0.3 + 0.1 * min(len(ev), 5),
+            f"{len(ev)} predictor(s) are nearly constant.", ev.head(8), {"Most common value's share": "{:.1%}"},
+            "With almost no variation there is little to learn from, so the coefficient is unstable and its effect cannot be told apart from noise.",
+            "Consider excluding them in the Base Data Model.",
+            lambda ev=ev: barh_fig(ev["Most common value's share"] * 100, "Share of rows with the most common value", "% of rows"))
+
+    # 7. Group differences: 0/1 columns that split Y widely
+    rows = []
+    for c in [c for c in x_cols if df[c].nunique() == 2]:
+        hi, lo = df[c] == df[c].max(), df[c] == df[c].min()
+        if min(hi.sum(), lo.sum()) >= SMALL_GROUP:
+            rows.append({"Column": c, "Rows with 1": int(hi.sum()), "Rows with 0": int(lo.sum()),
+                         "Mean Y (1)": yv[hi].mean(), "Mean Y (0)": yv[lo].mean(),
+                         "Gap (SDs of Y)": (yv[hi].mean() - yv[lo].mean()) / yv.std()})
+    if rows:
+        ev = pd.DataFrame(rows).set_index("Column")
+        ev = ev.reindex(ev["Gap (SDs of Y)"].abs().sort_values(ascending=False).index)
+        top = ev.index[0]
+        gap = float(abs(ev["Gap (SDs of Y)"].iloc[0]))
+        if gap > 0.3:
+            add("groups", "Groups with different average Y", (gap - 0.3) / 1.5,
+                f"**{top}** splits the rows into groups whose average Y differs by {gap:.2f} standard deviations.",
+                ev.head(8), {"Rows with 1": "{:,.0f}", "Rows with 0": "{:,.0f}", "Mean Y (1)": "{:.3f}", "Mean Y (0)": "{:.3f}", "Gap (SDs of Y)": "{:+.2f}"},
+                "A column that separates Y this much may relate to Y differently inside each group, which one pooled line would blur.",
+                "Use the Segment Explorer below to compare the groups, or add an interaction in Stage 4.",
+                lambda top=top: box_fig(df[top].map({df[top].min(): "0", df[top].max(): "1"}), yv, top, y))
+
+    # 8. Leakage
+    leak = corr_y[corr_y.abs() > LEAK_R]
+    if len(leak):
+        top = leak.abs().idxmax()
+        add("leakage", "Predictors that nearly equal Y", 1.0,
+            f"**{top}** has a correlation of {corr_y[top]:+.3f} with Y.",
+            pd.DataFrame({"r with Y": leak}), {"r with Y": "{:+.4f}"},
+            "A predictor this close to Y usually comes from the same source or is computed from it, so the fit looks perfect without being useful.",
+            "Exclude it in Stage 1 unless it is known before Y would be.",
+            lambda top=top: scatter_fig(df, top, y))
+
+    # 9. Panel or repeat structure
+    ents = [c for c in dict.fromkeys(list(recipe.get("dropped_high_cardinality", [])) + entity_candidates(raw)) if c in raw.columns]
+    if ents:
+        ev = pd.DataFrame({"Distinct values": [raw[c].nunique() for c in ents],
+                           "Rows per value": [len(raw) / raw[c].nunique() for c in ents]}, index=ents)
+        add("panel", "Rows that may repeat the same entity", 0.6,
+            f"{len(ents)} text column(s) repeat across rows, such as **{ents[0]}** ({ev['Rows per value'].iloc[0]:.1f} rows per value).",
+            ev, {"Distinct values": "{:,.0f}", "Rows per value": "{:.1f}"},
+            "If these identify repeated entities (one country seen every year), rows are not independent, so p-values look more certain than they are.",
+            "Use whole-entity holdout in Stage 5. Clustered standard errors are planned in U6.")
+
+    return sorted(out, key=lambda c: -c["severity"])
+
+
+def show_picture_findings(checks):
+    """Top findings as cards (headline, evidence, why, action, chart on request); the rest in an expander."""
+    ui.section("What stands out", "Python's checks, ranked by severity for this dataset. The top five are shown; each has its evidence and a chart one click away.")
+    if not checks:
+        st.success("No major issues flagged by the automatic checks.")
+        return
+
+    def card(chk):
+        with st.container(border=True):
+            ui.finding_header(chk["title"], chk["severity"])
+            st.markdown(chk["headline"])
+            st.caption(chk["why"])
+            st.dataframe(chk["evidence"].style.format(chk["fmt"], na_rep="n/a"))
+            st.caption("**What you can do:** " + chk["action"])
+            if chk["chart"] and st.toggle("Show chart", key=f"pic_chart_{chk['key']}"):
+                fig = chk["chart"]()
+                st.pyplot(fig)
+                plt.close(fig)
+
+    for chk in checks[:TOP_FINDINGS]:
+        card(chk)
+    if len(checks) > TOP_FINDINGS:
+        with st.expander(f"{len(checks) - TOP_FINDINGS} more finding(s), lower severity"):
+            for chk in checks[TOP_FINDINGS:]:
+                card(chk)
 
 
 # ---------- Stage 2 ----------
@@ -891,21 +1401,14 @@ def show_stage_2():
     st.dataframe(
         summary.style.format({"Corr with Y": "{:.3f}", "Skew": "{:.2f}", "VIF": "{:.1f}"})
         .background_gradient(subset=["Corr with Y"], cmap="Oranges", gmap=summary["Corr with Y"].abs()),
-        use_container_width=True,
     )
     how_to_read("summary")
 
-    notes = []
-    if high_vif:
-        notes.append("**High collinearity (VIF above 10):** " + ", ".join(high_vif)
-                     + ". Why it matters: these predictors mostly repeat others, so their coefficients can swing wildly or have the wrong sign.")
-    if skewed:
-        notes.append("**Strongly skewed predictors:** " + ", ".join(skewed[:8])
-                     + ". Why it matters: a few huge values can dominate the fit.")
-    if recipe["dropped_high_cardinality"]:
-        notes.append("**Possible panel data:** " + ", ".join(map(str, recipe["dropped_high_cardinality"]))
-                     + " was dropped as a high-cardinality text column. Why it matters: if it identifies repeated entities (such as one country observed many times), rows are not independent, so p-values look more certain than they are.")
-    ui.health_list(notes)
+    checks = picture_checks(df, y, recipe, result["raw"])
+    recipe["data_picture"] = [{"check": c["key"], "title": c["title"], "severity": round(c["severity"], 2),
+                               "headline": c["headline"].replace("**", "")} for c in checks]
+    st.divider()
+    show_picture_findings(checks)
 
     # --- Charts ---
     st.divider()
@@ -949,7 +1452,7 @@ def show_stage_2():
                 ft = freq_table(cat[c])
                 t1, t2 = st.columns(2)
                 with t1:
-                    st.dataframe(ft.style.format({"Count": "{:,.0f}", "Percent": "{:.1f}%"}), use_container_width=True)
+                    st.dataframe(ft.style.format({"Count": "{:,.0f}", "Percent": "{:.1f}%"}))
                 with t2:
                     fig = bar_fig(ft, c)
                     st.pyplot(fig)
@@ -967,18 +1470,17 @@ def show_stage_2():
             "Outliers (1.5×IQR rule)": out,
             "Outliers %": out / len(df) * 100,
         }, index=df.columns).sort_values("Outliers (1.5×IQR rule)", ascending=False)
-        st.dataframe(qual.style.format({"Filled (were missing)": "{:,.0f}", "Outliers (1.5×IQR rule)": "{:,.0f}", "Outliers %": "{:.1f}%"}),
-                     use_container_width=True)
+        st.dataframe(qual.style.format({"Filled (were missing)": "{:,.0f}", "Outliers (1.5×IQR rule)": "{:,.0f}", "Outliers %": "{:.1f}%"}))
         st.caption("A column with many filled values leans on median guesses, so treat its coefficient with more caution. "
                    "Outliers are values more than 1.5 interquartile ranges beyond the middle half of the data. They are not errors, just values that can pull a fit.")
 
     with st.expander("Show Class Math & Descriptive Stats"):
         st.markdown("**Descriptive statistics (Excel layout)**")
-        st.dataframe(descriptive_stats(df).style.format("{:,.4f}", na_rep="#N/A"), use_container_width=True)
+        st.dataframe(descriptive_stats(df).style.format("{:,.4f}", na_rep="#N/A"))
         st.markdown("**Five-number summary**")
-        st.dataframe(five_number(df).style.format("{:,.4f}"), use_container_width=True)
+        st.dataframe(five_number(df).style.format("{:,.4f}"))
         st.markdown("**Correlation matrix (Pearson)**")
-        st.dataframe(corr.style.format("{:.3f}"), use_container_width=True)
+        st.dataframe(corr.style.format("{:.3f}"))
 
     st.divider()
     show_segment_explorer(result)
@@ -1129,7 +1631,7 @@ def show_influential_rows(model, raw, top_n=10):
             "Fitted": model.fittedvalues.loc[top.index],
             "Residual": model.resid.loc[top.index],
         }).round(4)
-        st.dataframe(pd.concat([stats_cols, raw.loc[top.index]], axis=1), use_container_width=True)
+        st.dataframe(pd.concat([stats_cols, raw.loc[top.index]], axis=1))
         st.caption(f"{int((cooks > cut).sum()):,} of {len(cooks):,} rows are above the rule of thumb 4/n = {cut:.4f}; the {len(top)} largest are shown, "
                    "with the original columns from your file (row labels are positions in the uploaded table, starting at 0). "
                    "These are rows to look at, not rows to delete: check for data-entry errors, or whether they are a genuinely different kind of case. "
@@ -1203,15 +1705,15 @@ def show_stage_3():
     with st.expander("All coefficients (smallest p-value first)"):
         ct = coef.drop(index="Intercept")[["Coefficients", "P-value"]].sort_values("P-value")
         ct[f"Significant at {ALPHA}"] = np.where(ct["P-value"] <= ALPHA, "Yes", "No")
-        st.dataframe(ct.style.format({"Coefficients": "{:.4f}", "P-value": "{:.4f}"}), use_container_width=True)
+        st.dataframe(ct.style.format({"Coefficients": "{:.4f}", "P-value": "{:.4f}"}))
         st.markdown(HOW_TO_READ["coef"])
     with st.expander("Excel ToolPak tables"):
         st.markdown("**Regression Statistics**")
-        st.dataframe(reg.style.format("{:,.6f}"), use_container_width=True)
+        st.dataframe(reg.style.format("{:,.6f}"))
         st.markdown("**ANOVA**")
-        st.dataframe(anova.style.format("{:,.6g}", na_rep=""), use_container_width=True)
+        st.dataframe(anova.style.format("{:,.6g}", na_rep=""))
         st.markdown("**Coefficients**")
-        st.dataframe(coef.style.format("{:,.6g}"), use_container_width=True)
+        st.dataframe(coef.style.format("{:,.6g}"))
 
     # --- Residual diagnostics (one click away) ---
     with st.expander("How are the errors behaving? (residual diagnostics)"):
@@ -1285,21 +1787,312 @@ def show_stage_3():
 
 
 
+# ---------- Candidate generator and screening (U3-B) ----------
+# Python proposes every transformation a person would consider at first glance (from the same fixed menu),
+# then tests each one alone against the Base Data Model on the training rows. The analyst ticks what goes into the plan.
+GEN_DEFAULTS = {
+    "log_skew": 1.0,             # log: non-binary predictors with |skew| above this (and all values above -1)
+    "square_top_k": 5,           # square: this many strongest predictors, plus up to this many with curvature evidence
+    "combine_r": 0.7,            # combine: pairs of predictors with |r| at least this
+    "combine_max_pairs": 8,      # ...at most this many pairs (strongest first)
+    "interaction_top_k": 3,      # interaction: this many strongest predictors...
+    "interaction_max_binary": 4, # ...times this many 0/1 columns
+    "dup_r": 0.98,               # drop a candidate with |r| above this with anything already in the pool
+    "pool_cap": 60,              # keep at most this many candidates (best single-move BIC first)
+}
+GEN_LABELS = {
+    "log_skew": "Log: minimum |skew|", "square_top_k": "Square: top predictors",
+    "combine_r": "Combine: minimum |r| between the pair", "combine_max_pairs": "Combine: maximum pairs",
+    "interaction_top_k": "Interaction: top predictors", "interaction_max_binary": "Interaction: maximum 0/1 columns",
+    "dup_r": "Near-duplicate filter: |r| above", "pool_cap": "Pool cap (candidates kept)",
+}
+SCREEN_PAIR_TOP = 30   # pairs are tested among this many best single additions
+
+
+def family_of(step):
+    """x, ln1p_x and x_sq share the family of x; interactions and combinations are their own family."""
+    return str(step["cols"][0]) if step["op"] in ("log", "square") else step_name(step)
+
+
+def generate_candidates(df, y, x_cols, avail, settings, taken):
+    """Candidate steps (source "auto") that build, are not constant, and are not near-duplicates. `taken` = names already in use."""
+    yv, n = df[y], len(df)
+    nonbin = [c for c in x_cols if df[c].nunique() > 2]
+    corr_y = df[avail].corrwith(yv).fillna(0)
+    steps = []
+
+    def propose(op, cols, how, reason):
+        steps.append({"op": op, "cols": list(cols), "how": how, "reason": reason, "source": "auto"})
+
+    for c in nonbin:
+        sk = df[c].skew()
+        if abs(sk) > settings["log_skew"] and df[c].min() > -1:
+            propose("log", [c], None, f"auto: skew {sk:.1f}")
+    curv, ss = {}, float(((yv - yv.mean()) ** 2).sum())
+    for c in nonbin:
+        if df[c].nunique() > 5:
+            z = (df[c] - df[c].mean()) / df[c].std()
+            gain = 1 - float(((yv - np.polyval(np.polyfit(z, yv, 2), z)) ** 2).sum()) / ss - float(corr_y[c] ** 2)
+            if gain > 0.01:
+                curv[c] = gain
+    k = int(settings["square_top_k"])
+    by_r = list(corr_y[nonbin].abs().sort_values(ascending=False).index[:k])
+    for c in dict.fromkeys(by_r + sorted(curv, key=curv.get, reverse=True)[:k]):
+        propose("square", [c], None, f"auto: |r| with Y {abs(corr_y[c]):.2f}" + (f", curvature gain {curv[c]:.3f}" if c in curv else ""))
+    if len(nonbin) > 1:
+        cm = df[nonbin].corr()
+        pairs = sorted(((abs(cm.loc[a, b]), a, b) for a, b in combinations(nonbin, 2)
+                        if abs(cm.loc[a, b]) >= settings["combine_r"]), reverse=True)[:int(settings["combine_max_pairs"])]
+        for _, a, b in pairs:
+            why = f"auto: r = {cm.loc[a, b]:+.2f} between the pair"
+            propose("combine", [a, b], "mean", why)
+            propose("combine", [a, b], "difference", why)
+            if (df[b] != 0).all():
+                propose("combine", [a, b], "ratio", why)
+    bins = [c for c in avail if df[c].nunique() == 2 and min(int((df[c] == df[c].max()).sum()), int((df[c] == df[c].min()).sum())) >= SMALL_GROUP]
+    bins = sorted(bins, key=lambda c: -abs(corr_y[c]))[:int(settings["interaction_max_binary"])]
+    for a in by_r[:int(settings["interaction_top_k"])]:
+        for b in bins:
+            if b != a:
+                propose("interaction", [a, b], None, f"auto: does the slope of {a} differ between {b} groups?")
+
+    def zs(s):
+        return ((s - s.mean()) / s.std()).to_numpy(dtype=float)
+
+    pool = [(str(c), zs(df[c])) for c in x_cols]  # (family, standardized values) already in the pool
+    kept, built, seen = [], {}, set(map(str, taken))
+    for s in steps:
+        try:
+            name, col = build_feature(s, df)
+        except ValueError:
+            continue
+        if name in seen or not np.isfinite(col).all() or col.nunique() <= 1:
+            continue
+        fam, z = family_of(s), zs(col)
+        # a square is allowed to track its own parent closely (that pair is how curvature is fit)
+        if any(abs(float(z @ o) / (n - 1)) > settings["dup_r"] for f, o in pool if not (s["op"] == "square" and f == fam)):
+            continue
+        s.update(name=name, family=fam)
+        pool.append((fam, z))
+        seen.add(name)
+        kept.append(s)
+        built[name] = col
+    return kept, built
+
+
+def fast_stats(df, y, cols):
+    """fit(indices) -> Adjusted R Square, BIC and each term's t Stat, from small matrix solves (same OLS answer)."""
+    n = len(df)
+    X = df[cols].to_numpy(dtype=float)
+    sd = X.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = (X - X.mean(axis=0)) / sd
+    yc = df[y].to_numpy(dtype=float)
+    yc = yc - yc.mean()
+    G, c, sst = Z.T @ Z, Z.T @ yc, float(yc @ yc)
+
+    def fit(idx):
+        idx = list(idx)
+        k = len(idx)
+        if k == 0:
+            return {"adj": 0.0, "bic": bic_value(n, sst, 0), "t": np.array([])}
+        Gs = G[np.ix_(idx, idx)]
+        if n - k - 1 <= 0 or np.linalg.cond(Gs) > 1e10:
+            return None
+        inv = np.linalg.inv(Gs)
+        beta = inv @ c[idx]
+        sse = sst - float(beta @ c[idx])
+        if sse <= 1e-12 * sst:
+            return None
+        t = beta / np.sqrt(sse / (n - k - 1) * np.diag(inv))
+        return {"adj": 1 - (sse / sst) * (n - 1) / (n - k - 1), "bic": bic_value(n, sse, k), "t": t}
+
+    return fit
+
+
+def screen_moves(train, y, x_cols, cands):
+    """One change at a time from the Base Data Model: add each candidate, remove each base predictor, swap a base
+    predictor for a member of its family. Then pairs of the best additions. cands = {name: step}."""
+    names = list(cands)
+    cols = list(x_cols) + names
+    fit = fast_stats(train, y, cols)
+    base = list(range(len(x_cols)))
+    b0 = fit(base)
+    if b0 is None:
+        raise ValueError("The Base Data Model could not be fitted on the training rows.")
+    rows = []
+
+    def add_row(move, var, r, t, step=None):
+        if r is not None:
+            rows.append({"Move": move, "Variable": var, "Δ BIC": r["bic"] - b0["bic"], "Δ Adj R Square": r["adj"] - b0["adj"],
+                         "t Stat": t, "Formula": step_recipe(step) if step else "-", "Source": step["source"] if step else "base",
+                         "_idx": None})
+
+    for j, name in enumerate(names, start=len(x_cols)):
+        r = fit(base + [j])
+        add_row("Add", name, r, float(r["t"][-1]) if r else None, cands[name])
+        if rows and rows[-1]["Variable"] == name:
+            rows[-1]["_idx"] = j
+    for i, name in enumerate(x_cols):
+        add_row("Remove", str(name), fit([b for b in base if b != i]), float(b0["t"][i]))
+    for j, name in enumerate(names, start=len(x_cols)):
+        fam = cands[name].get("family")
+        if fam in map(str, x_cols) and cands[name]["op"] == "log":  # a log can replace its parent; a square sits beside it
+            i = [str(c) for c in x_cols].index(fam)
+            r = fit([b for b in base if b != i] + [j])
+            add_row("Swap", f"{fam} → {name}", r, float(r["t"][-1]) if r else None, cands[name])
+    moves = pd.DataFrame(rows)
+    pairs = pd.DataFrame()
+    if not moves.empty:
+        adds = moves[moves["Move"] == "Add"].nsmallest(SCREEN_PAIR_TOP, "Δ BIC")
+        single = dict(zip(adds["_idx"], adds["Δ BIC"]))
+        prow = []
+        for a, b in combinations(list(single), 2):
+            r = fit(base + [int(a), int(b)])
+            if r is not None:
+                d = r["bic"] - b0["bic"]
+                prow.append({"Add both": f"{cols[int(a)]} + {cols[int(b)]}", "Δ BIC": d, "Δ Adj R Square": r["adj"] - b0["adj"],
+                             "Together vs separately": d - single[a] - single[b]})
+        pairs = pd.DataFrame(prow)
+        if not pairs.empty:
+            pairs = pairs.sort_values("Δ BIC").head(15).reset_index(drop=True)
+        moves = moves.drop(columns="_idx").sort_values("Δ BIC").reset_index(drop=True)
+    return moves, pairs, {"base_bic": b0["bic"], "base_adj": b0["adj"]}
+
+
+def run_screening(df, y, x_cols, avail, plan, work, raw, settings, recipe):
+    """Generate candidates, screen them with the plan's own columns on the default training rows, apply the pool cap."""
+    plan_steps = {step_name(s): s for s in plan if step_name(s)}
+    plan_cols = [c for c in work.columns if c not in df.columns and c != y]
+    gen, built = generate_candidates(df, y, x_cols, avail, settings, list(work.columns) + list(df.columns))
+    frame = df[[y] + list(x_cols)].copy()
+    cands = {}
+    for c in plan_cols:
+        frame[c] = work[c]
+        st_ = dict(plan_steps.get(c, {"op": "?", "cols": [c], "how": None, "reason": ""}))
+        st_.setdefault("source", "user")
+        st_["family"] = family_of(st_) if st_["op"] != "?" else c
+        cands[c] = st_
+    for s in gen:
+        frame[s["name"]] = built[s["name"]]
+        cands[s["name"]] = s
+    mask = split_holdout(frame.index, raw, None)  # the same default split Stage 5 starts with (random rows)
+    moves, pairs, base = screen_moves(frame[~mask], y, x_cols, cands)
+    adds = moves[(moves["Move"] == "Add") & (moves["Source"] == "auto")].set_index("Variable")
+    cap = int(settings["pool_cap"])
+    keep = set(adds.nsmallest(cap, "Δ BIC").index)
+    gen = [s for s in gen if s["name"] in keep]
+    dropped = [v for v in adds.index if v not in keep]
+    if dropped:
+        moves = moves[~moves["Variable"].isin(dropped)].reset_index(drop=True)
+    for s in gen:
+        s["screen_bic"] = float(adds.loc[s["name"], "Δ BIC"])
+        s["screen_adj"] = float(adds.loc[s["name"], "Δ Adj R Square"])
+        s["screen_t"] = adds.loc[s["name"], "t Stat"]
+    recipe["candidates_generated"] = [{k: s.get(k) for k in ("name", "op", "cols", "how", "family", "source", "screen_bic", "screen_adj")}
+                                      for s in gen]
+    best = moves.head(5)
+    recipe["screening_summary"] = {
+        "train_rows": int((~mask).sum()), "split": "default random-row holdout split (seed HOLDOUT_SEED)",
+        "candidates_generated": len(gen), "cut_by_pool_cap": len(dropped), "moves_tested": len(moves), "pairs_tested": len(pairs),
+        "best_moves": [f"{r['Move']} {r['Variable']}: Δ BIC {r['Δ BIC']:+.1f}, Δ Adj R Square {r['Δ Adj R Square']:+.4f}" for _, r in best.iterrows()],
+        "settings": dict(settings),
+    }
+    return {"gen": gen, "moves": moves, "pairs": pairs, "base": base, "plan_names": sorted(plan_steps),
+            "train_rows": int((~mask).sum()), "cut": len(dropped), "version": st.session_state.get("screen_version", 0) + 1}
+
+
+def show_candidates(df, y, x_cols, avail, plan, edited, work, raw, recipe):
+    """Generator settings, the run button, the candidate table with Add ticks, and the screening tables."""
+    ui.section("Automatic candidates and screening",
+               "Python proposes every transformation a person would consider at first glance, then tests each one alone against your Base Data Model "
+               "on the training rows. Nothing joins the plan until you tick it.")
+    with st.expander("Generator settings"):
+        settings = {}
+        cols = st.columns(4)
+        for i, (key, default) in enumerate(GEN_DEFAULTS.items()):
+            with cols[i % 4]:
+                if isinstance(default, float) and default < 10:
+                    settings[key] = st.number_input(GEN_LABELS[key], 0.0, 10.0 if key == "log_skew" else 1.0, default, 0.05, key=f"gen_{key}")
+                else:
+                    settings[key] = int(st.number_input(GEN_LABELS[key], 0, 500, int(default), 1, key=f"gen_{key}"))
+    if st.button("Generate candidates and screen them"):
+        with st.spinner("Building and screening candidates..."):
+            try:
+                st.session_state.screening = run_screening(df, y, x_cols, avail, plan, work, raw, settings, recipe)
+                st.session_state.screen_version = st.session_state.screening["version"]
+            except Exception as e:
+                st.error(f"Screening failed: {e}")
+    sc = st.session_state.get("screening")
+    if not sc:
+        return
+    if sc["plan_names"] != sorted(step_name(s) for s in plan if step_name(s)):
+        st.warning("The plan changed since the last screening. Generate again to screen the current plan.")
+    moves = sc["moves"]
+    best = moves.iloc[0] if not moves.empty else None
+    ui.metric_strip([
+        ("Candidates generated", f"{len(sc['gen'])}", f"Built, valid, and not near-duplicates. {sc['cut']} more were cut by the pool cap." if sc["cut"] else "Built, valid, and not near-duplicates."),
+        ("Moves tested", f"{len(moves):,}", "Single changes from the Base Data Model: add, remove, or swap one predictor."),
+        ("Best single move", f"{best['Δ BIC']:+.1f} BIC" if best is not None else "n/a",
+         f"{best['Move']} {best['Variable']}. Lower BIC is better; a drop of more than about 10 is strong evidence." if best is not None else ""),
+        ("Training rows used", f"{sc['train_rows']:,}", "The default random-row training split, so the holdout stays unseen."),
+    ])
+
+    # --- Candidate table with the deciding numbers beside the tick box ---
+    if sc["gen"]:
+        st.markdown("**Generated candidates** (best single move first). Tick to add to the plan.")
+        cand = pd.DataFrame([{"Add": False, "Candidate": s["name"], "Formula": step_recipe(s), "Family": s["family"],
+                              "Δ BIC": s["screen_bic"], "Δ Adj R Square": s["screen_adj"], "t Stat": s["screen_t"], "Why proposed": s["reason"]}
+                             for s in sc["gen"]]).sort_values("Δ BIC").reset_index(drop=True)
+        picked = st.data_editor(
+            cand, key=f"cand_editor_{sc['version']}", hide_index=True,
+            disabled=[c for c in cand.columns if c != "Add"],
+            column_config={"Δ BIC": st.column_config.NumberColumn(format="%+.1f"),
+                           "Δ Adj R Square": st.column_config.NumberColumn(format="%+.4f"),
+                           "t Stat": st.column_config.NumberColumn(format="%.2f")},
+        )
+        ticked = set(picked.loc[picked["Add"], "Candidate"])
+        if st.button(f"Add {len(ticked)} ticked candidate(s) to the plan", disabled=not ticked, type="primary"):
+            rows = [{"op": s["op"], "col_a": s["cols"][0], "col_b": s["cols"][1] if len(s["cols"]) > 1 else None,
+                     "how": s["how"], "reason": f"{s['reason']}; screening Δ BIC {s['screen_bic']:+.1f}", "source": "auto"}
+                    for s in sc["gen"] if s["name"] in ticked]
+            st.session_state.plan_df = pd.concat([edited, pd.DataFrame(rows, columns=PLAN_COLS, dtype=object)], ignore_index=True)
+            st.session_state.plan_version = st.session_state.get("plan_version", 0) + 1
+            st.rerun()
+    else:
+        st.info("No new candidates: everything the generator would propose is already in the plan, invalid, or a near-duplicate.")
+
+    with st.expander("Screening: every single move, including your plan's columns and removing base predictors"):
+        st.dataframe(moves.style.format({"Δ BIC": "{:+.1f}", "Δ Adj R Square": "{:+.4f}", "t Stat": "{:.2f}"}, na_rep="-")
+                     .background_gradient(subset=["Δ BIC"], cmap="Oranges", gmap=-moves["Δ BIC"].clip(upper=0)),
+                     hide_index=True)
+        st.markdown("**How to read this:** each row changes one thing in your Base Data Model and refits on the training rows. "
+                    "**Δ BIC** below 0 means the change helps after charging for complexity (below about −10 is strong evidence); "
+                    "**Δ Adj R Square** is the same idea on the class scale. **t Stat** is the new term's t (for Remove, the removed term's t in the base model); "
+                    "beyond about ±2 means the term is unlikely to be pure chance. A move that helps alone may add little once others are in, "
+                    "which is why Stage 5 tests combinations.")
+        if not sc["pairs"].empty:
+            st.markdown("**Best pairs of additions**")
+            st.dataframe(sc["pairs"].style.format({"Δ BIC": "{:+.1f}", "Δ Adj R Square": "{:+.4f}", "Together vs separately": "{:+.1f}"}),
+                         hide_index=True)
+            st.caption("**Together vs separately** below 0 means the two help more as a pair than their single gains add up to; above 0 means they overlap.")
+
+
 # ---------- Stage 4: Feature workshop ----------
 OPS = ["log", "square", "interaction", "combine", "drop"]
 HOWS = ["sum", "mean", "ratio", "difference"]
-PLAN_COLS = ["op", "col_a", "col_b", "how", "reason"]
+PLAN_COLS = ["op", "col_a", "col_b", "how", "reason", "source"]
 
 
 def reset_features():
     """Clear the feature plan (new file, new cleaning, or a new Base Data Model)."""
-    for k in ["plan_df", "suggested", "feature_work"]:
+    for k in ["plan_df", "suggested", "feature_work", "screening"]:
         st.session_state.pop(k, None)
     st.session_state.plan_version = st.session_state.get("plan_version", 0) + 1
     c = st.session_state.get("clean")
     if c:
         c.pop("feature_table", None)
-        for k in ("feature_plan", "pool_columns", "engineered_columns"):
+        for k in ("feature_plan", "pool_columns", "engineered_columns", "candidates_generated", "screening_summary"):
             c["recipe"].pop(k, None)
     reset_search()
 
@@ -1374,7 +2167,7 @@ def step_from_row(row):
     if op is None:
         return None
     cols = [c for c in (val("col_a"), val("col_b")) if c is not None]
-    return {"op": op, "cols": cols, "how": val("how"), "reason": val("reason") or ""}
+    return {"op": op, "cols": cols, "how": val("how"), "reason": val("reason") or "", "source": val("source") or "user"}
 
 
 def parse_plan(text, avail):
@@ -1393,7 +2186,7 @@ def parse_plan(text, avail):
             continue
         rows.append({
             "op": s["op"], "col_a": cols[0], "col_b": cols[1] if len(cols) > 1 else None,
-            "how": how, "reason": s.get("reason", ""),
+            "how": how, "reason": s.get("reason", ""), "source": "claude",
         })
     return data.get("explanation", ""), pd.DataFrame(rows, columns=PLAN_COLS, dtype=object), skipped
 
@@ -1482,13 +2275,13 @@ def show_stage_4():
         plan_df,
         num_rows="dynamic",
         key=f"plan_editor_{st.session_state.get('plan_version', 0)}",
-        use_container_width=True,
         column_config={
             "op": st.column_config.SelectboxColumn("Operation", options=OPS),
             "col_a": st.column_config.SelectboxColumn("Column A", options=[str(c) for c in avail]),
             "col_b": st.column_config.SelectboxColumn("Column B (interaction/combine)", options=[str(c) for c in avail]),
             "how": st.column_config.SelectboxColumn("How (combine only)", options=HOWS),
             "reason": st.column_config.TextColumn("Reason"),
+            "source": st.column_config.TextColumn("Source", disabled=True, help="claude, user, or auto (the candidate generator)"),
         },
     )
     plan = [s for s in (step_from_row(r) for _, r in edited.iterrows()) if s]
@@ -1500,10 +2293,10 @@ def show_stage_4():
     log_df = pd.DataFrame(log, columns=["Step", "OK", "Result"])
     if bad_n:
         st.warning(f"{bad_n} step(s) could not be built and were skipped. Fix or delete them below.")
-        st.dataframe(log_df, use_container_width=True, hide_index=True)
+        st.dataframe(log_df, hide_index=True)
     elif log:
         with st.expander(f"All {ok_n} step(s) built successfully"):
-            st.dataframe(log_df, use_container_width=True, hide_index=True)
+            st.dataframe(log_df, hide_index=True)
 
     new_cols = [c for c in work.columns if c not in df.columns]
     pool_n = work.shape[1] - 1
@@ -1524,6 +2317,8 @@ def show_stage_4():
         ])
 
     st.session_state.feature_work = work
+    st.divider()
+    show_candidates(df, y, x_cols, avail, plan, edited, work, result["raw"], recipe)
     st.divider()
     notes_box("Analyst notes (why you chose these features, what you rejected)", "notes_stage4")
     st.button("Approve feature plan →", on_click=approve_features, args=(plan,),
@@ -1625,6 +2420,13 @@ def health_notes(model, x_cols, df, recipe, diag):
 
 
 
+
+
+
+
+
+
+
 # ---------- Stage 5: Pool & Search ----------
 FULL_LIMIT = 32767      # run every subset when there are this many or fewer
 DEFAULT_SAMPLE = 5000   # random subsets when the pool is larger
@@ -1633,7 +2435,10 @@ SEARCH_SEED = 42        # fixed so a sampled search is reproducible
 HOLDOUT_FRAC = 0.20     # share of rows set aside, never seen by the search
 HOLDOUT_SEED = 42       # fixed so the split is reproducible (Stage 6 re-creates it)
 SEARCH_RECIPE_KEYS = ("models_searched", "search_mode", "search_pool", "search_max_size",
-                      "search_skipped", "search_benchmarks", "leaderboard", "search_starts", "holdout","final_model","final_report")
+                      "search_skipped", "search_benchmarks", "leaderboard", "search_starts", "holdout",
+                      "final_model", "final_report", "search_score", "cv", "luck_benchmark",
+                      "search_locked", "search_excluded", "search_weights", "search_rules",
+                      "batch_learning", "bootstrap_stability")
 
 
 def reset_search():
@@ -1641,6 +2446,7 @@ def reset_search():
     st.session_state.pop("search", None)
     st.session_state.pop("final_report", None)
     st.session_state.pop("excel_file", None)
+    st.session_state.pop("var_states", None)
     st.session_state.pool_version = st.session_state.get("pool_version", 0) + 1
     c = st.session_state.get("clean")
     if c:
@@ -1678,8 +2484,69 @@ def fit_and_score(train, test, y, names):
             "holdout_rmse": float(np.sqrt((err ** 2).mean()))}
 
 
+SEARCH_SCORE = "bic"   # "bic" (lower is better) or "adj_r2"; the search ranks models by this
+CV_FOLDS = 5           # cross-validation folds for the leaderboard models
+CV_SEED = 42
+
+
+def bic_value(n, sse, k):
+    """BIC = n*ln(SSE/n) + (k+1)*ln(n). One formula for the fast scorer and statsmodels, so they match exactly."""
+    return n * math.log(sse / n) + (k + 1) * math.log(n)
+
+
+def top_row(rank, m, names):
+    """One leaderboard row from a fitted statsmodels model."""
+    return {"Rank": rank,
+            "Adjusted R Square": float(m.rsquared_adj),
+            "R Square": float(m.rsquared),
+            "Standard Error": float(np.sqrt(m.mse_resid)),
+            "Predictors": len(names),
+            "BIC": bic_value(int(m.nobs), float(m.ssr), int(m.df_model)),
+            "Variables": ", ".join(map(str, names))}
+
+
+def add_bic_gap(top):
+    """BIC Gap = this model's BIC minus the lowest BIC on the leaderboard (above about 10 is strong evidence of worse)."""
+    best = min(r["BIC"] for r in top)
+    for r in top:
+        r["BIC Gap"] = r["BIC"] - best
+
+
+def make_folds(index, raw, entity_col, k=CV_FOLDS, seed=CV_SEED):
+    """Fold number for every training row. Whole entities share a fold when entity_col is given."""
+    rng = np.random.default_rng(seed)
+    if entity_col:
+        ents = raw.loc[index, entity_col].astype(str).to_numpy()
+        uniq = rng.permutation(np.unique(ents))
+        k = max(2, min(k, len(uniq)))
+        fold_of = {e: i % k for i, e in enumerate(uniq)}
+        return np.array([fold_of[e] for e in ents]), k
+    k = max(2, min(k, len(index)))
+    return rng.permutation(len(index)) % k, k
+
+
+def attach_cv(res, train, y, raw, entity_col):
+    """Cross-validate every leaderboard model on the TRAINING rows only. Adds CV RMSE and its standard error."""
+    folds, k = make_folds(train.index, raw, entity_col)
+    for row in res["top"]:
+        names = row["Variables"].split(", ")
+        if not all(n in train.columns for n in names):
+            continue
+        rmses = []
+        for f in range(k):
+            tr, te = train[folds != f], train[folds == f]
+            if len(te) == 0 or len(tr) <= len(names) + 1:
+                continue
+            rmses.append(fit_and_score(tr, te, y, names)["holdout_rmse"])
+        if len(rmses) >= 2:
+            row["CV RMSE"] = float(np.mean(rmses))
+            row["CV RMSE SE"] = float(np.std(rmses, ddof=1) / np.sqrt(len(rmses)))
+    res["cv_info"] = {"folds": k, "grouped_by": entity_col or "random rows",
+                      "mean_guess_rmse": float(train[y].std(ddof=0))}
+
+
 def attach_holdout(res, work, df, mask, y, base_cols, entity_col):
-    """Add holdout columns to the leaderboard and score the baseline. Fit on train, score on holdout."""
+    """Add holdout columns to the leaderboard and score the baseline. Fit on train, score on holdout. Also adds CV."""
     train, test = work[~mask], work[mask]
     for row in res["top"]:
         names = row["Variables"].split(", ")
@@ -1696,30 +2563,150 @@ def attach_holdout(res, work, df, mask, y, base_cols, entity_col):
     res["holdout"] = {"mode": "whole entities" if entity_col else "random rows",
                       "entity_column": entity_col, "fraction": HOLDOUT_FRAC, "seed": HOLDOUT_SEED,
                       "n_train": int((~mask).sum()), "n_holdout": int(mask.sum()), "baseline": base}
+    attach_cv(res, train, y, st.session_state.clean["raw"], entity_col)
 
 
-def count_subsets(k, max_size):
-    return sum(math.comb(k, s) for s in range(1, max_size + 1))
+# ---------- Human checkpoint and steering (U4) ----------
+VAR_STATES = ["Lock", "Favor", "Neutral", "Exclude"]
+FAVOR_MULT = 2.5   # Favor = drawn this many times as often as Neutral in random draws
 
 
-def make_subsets(k, max_size, sample_n, must=()):
-    """Index tuples to test. All if few enough, otherwise a random sample plus anchor models."""
-    if count_subsets(k, max_size) <= FULL_LIMIT:
-        return [c for s in range(1, max_size + 1) for c in combinations(range(k), s)], "all"
-    rng = np.random.default_rng(SEARCH_SEED)
+def column_info(pool, base_cols, plan):
+    """name -> family, role (parent / version / square), parents (for the hierarchy rule) and source, for every pool column."""
+    steps = {step_name(s): s for s in plan if step_name(s)}
+    info = {}
+    for c in pool:
+        s = steps.get(c)
+        if s is None:
+            info[c] = {"family": str(c), "role": "parent", "parents": [], "source": "base" if c in base_cols else "data"}
+            continue
+        fam = family_of(s)
+        role = "square" if s["op"] == "square" else ("parent" if fam == c else "version")
+        parents = [str(p) for p in s["cols"]] if s["op"] in ("square", "interaction") else []
+        info[c] = {"family": fam, "role": role, "parents": parents, "source": s.get("source") or "user"}
+    return info
+
+
+def make_rule(cols, info, one_per_family, hierarchy):
+    """ok(indices, hier=True) -> True when a model obeys the rules, or None when no rule is on.
+    Family rule: one version per family (x, ln1p_x, x_sq), except x_sq beside its parent x.
+    Hierarchy rule: a square or interaction needs its parent columns (those still in the pool)."""
+    if not (one_per_family or hierarchy):
+        return None
+    fam = [info[c]["family"] for c in cols]
+    role = [info[c]["role"] for c in cols]
+    where = {c: i for i, c in enumerate(cols)}
+    parents = [[where[p] for p in info[c]["parents"] if p in where] for c in cols]
+
+    def ok(idx, hier=True):
+        s = set(idx)
+        if one_per_family:
+            seen = {}
+            for i in s:
+                seen.setdefault(fam[i], []).append(role[i])
+            for roles in seen.values():
+                if len(roles) > 1 and sorted(roles) != ["parent", "square"]:
+                    return False
+        if hierarchy and hier:
+            return all(p in s for i in s for p in parents[i])
+        return True
+
+    return ok
+
+
+def build_steer(cols, states, info, mult, one_per_family, hierarchy):
+    """Everything the search needs to follow the checkpoint: locked indices, draw weights, the rule, and a plain record."""
+    where = {c: i for i, c in enumerate(cols)}
+    return {"locked": tuple(i for i, c in enumerate(cols) if states.get(c) == "Lock"),
+            "parents": [[where[p] for p in info[c]["parents"] if p in where] for c in cols],
+            "weights": np.array([float(mult) if states.get(c) == "Favor" else 1.0 for c in cols]),
+            "ok": make_rule(cols, info, one_per_family, hierarchy),
+            "cfg": {"locked": [c for c in cols if states.get(c) == "Lock"],
+                    "favored": [c for c in cols if states.get(c) == "Favor"],
+                    "excluded": sorted(c for c, v in states.items() if v == "Exclude"),
+                    "favor_multiplier": float(mult), "one_version_per_family": bool(one_per_family),
+                    "hierarchy": bool(hierarchy)}}
+
+
+def repair(idx, steer, max_size):
+    """Turn a start into one that obeys the steering: locked columns first, then the rest in the given order,
+    each kept only if the family rule still holds. Then add missing parents (hierarchy) or drop the child."""
+    locked = list(steer["locked"]) if steer else []
+    ok = steer["ok"] if steer else None
+    keep = []
+    for i in locked + [i for i in idx if i not in locked]:
+        if i not in keep and len(keep) < max_size and (ok is None or ok(keep + [i], hier=False)):
+            keep.append(i)
+    if ok is not None and not ok(keep):
+        for i in list(keep):
+            if i not in keep:
+                continue
+            need = [p for p in steer["parents"][i] if p not in keep]
+            if not need:
+                continue
+            if len(keep) + len(need) <= max_size and ok(keep + need, hier=False):
+                keep = keep + need
+            elif i not in locked:
+                keep.remove(i)
+    if not keep or (ok is not None and not ok(keep)):
+        return None
+    return tuple(sorted(keep))
+
+
+def count_subsets(k, max_size, n_locked=0):
+    """Number of models up to max_size when n_locked columns are in every model (before the family/hierarchy rules)."""
+    free, room = k - n_locked, max_size - n_locked
+    return sum(math.comb(free, s) for s in range(0 if n_locked else 1, min(room, free) + 1))
+
+
+def draw_subsets(k, max_size, n, steer, rng):
+    """n distinct random models. Favored columns are drawn more often; locked columns are always in; rule-breakers are redrawn."""
+    locked = tuple(steer["locked"]) if steer else ()
+    ok = steer["ok"] if steer else None
+    free = [i for i in range(k) if i not in locked]
+    room = min(max_size - len(locked), len(free))
+    lo = 0 if locked else 1
+    p = None
+    if steer is not None and free:
+        w = steer["weights"][free]
+        p = w / w.sum()
     seen, tries = set(), 0
-    while len(seen) < sample_n and tries < sample_n * 20:
-        size = int(rng.integers(1, max_size + 1))
-        seen.add(tuple(sorted(rng.choice(k, size=size, replace=False).tolist())))
+    while len(seen) < n and tries < n * 20 and room >= lo:
         tries += 1
-    anchors = [tuple(range(k))] + [tuple(i for i in range(k) if i != j) for j in range(k)]
-    anchors += [tuple(sorted(m)) for m in must]
-    seen.update(a for a in anchors if 0 < len(a) <= max_size)
+        size = int(rng.integers(lo, room + 1))
+        pickd = rng.choice(free, size=size, replace=False, p=p).tolist() if size else []
+        t = tuple(sorted(set(pickd) | set(locked)))
+        if t and (ok is None or ok(t)):
+            seen.add(t)
+    return seen
+
+
+def make_subsets(k, max_size, sample_n, must=(), steer=None):
+    """Index tuples to test. All if few enough, otherwise a (weighted) random sample plus anchor models. Obeys the steering."""
+    locked = tuple(steer["locked"]) if steer else ()
+    ok = steer["ok"] if steer else None
+    if len(locked) > max_size:
+        raise ValueError("More variables are locked than the model-size limit allows.")
+    free = [i for i in range(k) if i not in locked]
+    room = min(max_size - len(locked), len(free))
+
+    def good(t):
+        return 0 < len(t) <= max_size and (ok is None or ok(t))
+
+    if count_subsets(k, max_size, len(locked)) <= FULL_LIMIT:
+        subs = (tuple(sorted(locked + c)) for s in range(0 if locked else 1, room + 1) for c in combinations(free, s))
+        return [t for t in subs if good(t)], "all"
+    seen = draw_subsets(k, max_size, sample_n, steer, np.random.default_rng(SEARCH_SEED))
+    anchors = [tuple(range(k))] + [tuple(i for i in range(k) if i != j) for j in range(k)] + [tuple(m) for m in must]
+    for a in anchors:
+        r = repair(a, steer, max_size) if steer else tuple(sorted(a))
+        if r and good(r):
+            seen.add(r)
     return sorted(seen), "sample"
 
 
 def score_subsets(df, y, cols, subsets, progress=None):
-    """Fast Adjusted R Square for each subset (same OLS answer, tiny matrix solves)."""
+    """Fast Adjusted R Square and BIC for each subset (same OLS answer, tiny matrix solves)."""
     n = len(df)
     X = df[cols].to_numpy(dtype=float)
     sd = X.std(axis=0)
@@ -1728,47 +2715,47 @@ def score_subsets(df, y, cols, subsets, progress=None):
     yc = df[y].to_numpy(dtype=float)
     yc = yc - yc.mean()
     G, c, sst = Z.T @ Z, Z.T @ yc, float(yc @ yc)
-    keep, scores = [], []
+    keep, adj_list, bic_list = [], [], []
     for i, idx in enumerate(subsets):
         idx = list(idx)
         k = len(idx)
         Gs = G[np.ix_(idx, idx)]
         if n - k - 1 <= 0 or np.linalg.cond(Gs) > 1e10:
             continue  # singular or too many predictors: skip
-        b = np.linalg.solve(Gs, c[idx])
-        r2 = float(b @ c[idx]) / sst
+        expl = float(np.linalg.solve(Gs, c[idx]) @ c[idx])
+        sse = sst - expl
+        if sse <= 1e-12 * sst:
+            continue  # a perfect fit makes BIC undefined: skip
         keep.append(idx)
-        scores.append(1 - (1 - r2) * (n - 1) / (n - k - 1))
+        adj_list.append(1 - (1 - expl / sst) * (n - 1) / (n - k - 1))
+        bic_list.append(bic_value(n, sse, k))
         if progress is not None and i % 500 == 0:
             progress.progress(min(i / len(subsets), 1.0))
-    return keep, np.array(scores), len(subsets) - len(keep)
+    return keep, np.array(adj_list), len(subsets) - len(keep), np.array(bic_list)
 
 
-def run_search(df, y, cols, max_size, sample_n, progress=None, must=()):
-    subsets, mode = make_subsets(len(cols), max_size, sample_n, must)
-    keep, scores, skipped = score_subsets(df, y, cols, subsets, progress)
-    if len(scores) == 0:
+def run_search(df, y, cols, max_size, sample_n, progress=None, must=(), steer=None):
+    subsets, mode = make_subsets(len(cols), max_size, sample_n, must, steer)
+    keep, adj, skipped, bic = score_subsets(df, y, cols, subsets, progress)
+    if len(adj) == 0:
         raise ValueError("No valid models could be fitted from this pool.")
-    order = np.argsort(-scores)
+    rank = -bic if SEARCH_SCORE == "bic" else adj  # higher rank value = better model
+    order = np.argsort(-rank)
     top = []
-    for rank, j in enumerate(order[:TOP_N], start=1):
+    for r, j in enumerate(order[:TOP_N], start=1):
         names = [cols[i] for i in keep[j]]
-        m = run_regression(df, y, names)  # exact statsmodels numbers for the leaderboard
-        top.append({
-            "Rank": rank,
-            "Adjusted R Square": float(m.rsquared_adj),
-            "R Square": float(m.rsquared),
-            "Standard Error": float(np.sqrt(m.mse_resid)),
-            "Predictors": len(names),
-            "Variables": ", ".join(map(str, names)),
-        })
-    check_ok = abs(top[0]["Adjusted R Square"] - float(scores[order[0]])) < 1e-8
-    return {"mode": mode, "models_run": len(keep), "skipped": skipped, "scores": scores,
-            "top": top, "pool": list(cols), "max_size": max_size, "check_ok": check_ok}
+        top.append(top_row(r, run_regression(df, y, names), names))  # exact statsmodels numbers
+    add_bic_gap(top)
+    fast = float(rank[order[0]])
+    exact = -top[0]["BIC"] if SEARCH_SCORE == "bic" else top[0]["Adjusted R Square"]
+    check_ok = abs(fast - exact) < 1e-6 * max(1.0, abs(fast))
+    return {"mode": mode, "models_run": len(keep), "skipped": skipped, "scores": adj,
+            "top": top, "pool": list(cols), "max_size": max_size, "check_ok": check_ok,
+            "score_name": SEARCH_SCORE}
 
 
 def make_scorer(df, y, cols):
-    """Returns score(indices) -> Adjusted R Square (or None if unfittable), with caching."""
+    """Returns (score, cache, adj_cache). score(indices) -> ranking value (higher is better) or None if unfittable."""
     n = len(df)
     X = df[cols].to_numpy(dtype=float)
     sd = X.std(axis=0)
@@ -1777,7 +2764,7 @@ def make_scorer(df, y, cols):
     yc = df[y].to_numpy(dtype=float)
     yc = yc - yc.mean()
     G, c, sst = Z.T @ Z, Z.T @ yc, float(yc @ yc)
-    cache = {}
+    cache, adj_cache = {}, {}
 
     def score(idx):
         key = tuple(sorted(idx))
@@ -1788,28 +2775,38 @@ def make_scorer(df, y, cols):
             Gs = G[np.ix_(key, key)]
             if np.linalg.cond(Gs) <= 1e10:
                 ck = c[list(key)]
-                r2 = float(np.linalg.solve(Gs, ck) @ ck) / sst
-                val = 1 - (1 - r2) * (n - 1) / (n - k - 1)
+                expl = float(np.linalg.solve(Gs, ck) @ ck)
+                sse = sst - expl
+                if sse > 1e-12 * sst:
+                    adj = 1 - (1 - expl / sst) * (n - 1) / (n - k - 1)
+                    adj_cache[key] = adj
+                    val = -bic_value(n, sse, k) if SEARCH_SCORE == "bic" else adj
         cache[key] = val
         return val
 
-    return score, cache
+    return score, cache, adj_cache
 
 
-def hill_climb(score, k, start, max_size):
-    """Steepest ascent: apply the best single add, remove, or swap until nothing improves."""
+def hill_climb(score, k, start, max_size, steer=None):
+    """Steepest ascent: apply the best single add, remove, or swap until nothing improves.
+    Every legal move is tested each step, so weights do not change the climb; locks and rules do."""
+    locked = set(steer["locked"]) if steer else set()
+    ok = steer["ok"] if steer else None
     cur = tuple(sorted(start))
     cur_s = score(cur)
     while True:
         out = [i for i in range(k) if i not in cur]
+        movable = [j for j in cur if j not in locked]
         nbrs = []
         if len(cur) < max_size:
             nbrs += [cur + (i,) for i in out]
         if len(cur) > 1:
-            nbrs += [tuple(x for x in cur if x != j) for j in cur]
-        nbrs += [tuple(i if x == j else x for x in cur) for j in cur for i in out]
+            nbrs += [tuple(x for x in cur if x != j) for j in movable]
+        nbrs += [tuple(i if x == j else x for x in cur) for j in movable for i in out]
         best, best_s = None, cur_s
         for nb in nbrs:
+            if ok is not None and not ok(nb):
+                continue
             s = score(nb)
             if s is not None and s > best_s + 1e-9:
                 best, best_s = tuple(sorted(nb)), s
@@ -1818,49 +2815,57 @@ def hill_climb(score, k, start, max_size):
         cur, cur_s = best, best_s
 
 
-def run_hybrid(df, y, cols, max_size, n_random, n_starts, must=(), progress=None):
-    """Random scouting, then hill-climb from the baseline, the full pool, and the best scouts."""
+def run_hybrid(df, y, cols, max_size, n_random, n_starts, must=(), progress=None, steer=None, plan_start=None):
+    """(Weighted) random scouting, then hill-climb from the baseline, your plan, the full pool, and the best scouts."""
     k = len(cols)
-    score, cache = make_scorer(df, y, cols)
-    rng = np.random.default_rng(SEARCH_SEED)
-    scouts = set()
-    for _ in range(n_random):
-        size = int(rng.integers(1, max_size + 1))
-        scouts.add(tuple(sorted(rng.choice(k, size=size, replace=False).tolist())))
+    if steer and len(steer["locked"]) > max_size:
+        raise ValueError("More variables are locked than the model-size limit allows.")
+    score, cache, adj_cache = make_scorer(df, y, cols)
+    scouts = draw_subsets(k, max_size, n_random, steer, np.random.default_rng(SEARCH_SEED))
     ranked = sorted((score(s), s) for s in scouts if score(s) is not None)[::-1]
 
-    starts = [("Baseline", tuple(sorted(m))) for m in must]
+    fix = (lambda t: repair(t, steer, max_size)) if steer else (lambda t: tuple(sorted(t)))
+    starts = [("Baseline", fix(m)) for m in must]
+    if plan_start:
+        starts.append(("Your plan", fix(plan_start)))
     if k <= max_size:
-        starts.append(("Full pool", tuple(range(k))))
+        starts.append(("Full pool", fix(tuple(range(k)))))
     starts += [(f"Random #{i}", s) for i, (_, s) in enumerate(ranked[:n_starts], 1)]
+    used, uniq = set(), []
+    for label, s0 in starts:
+        if s0 and s0 not in used:
+            used.add(s0)
+            uniq.append((label, s0))
 
     rows, ends = [], set()
-    for i, (label, s0) in enumerate(starts):
-        s_start = score(s0)
-        if s_start is None:
+    for i, (label, s0) in enumerate(uniq):
+        if score(s0) is None:
             continue
-        end, s_end = hill_climb(score, k, s0, max_size)
+        end, _ = hill_climb(score, k, s0, max_size, steer)
         ends.add(end)
-        rows.append({"Start": label, "Start Adj R Square": s_start, "End Adj R Square": s_end,
+        rows.append({"Start": label, "Start Adj R Square": adj_cache[tuple(sorted(s0))],
+                     "End Adj R Square": adj_cache[end],
                      "Predictors": len(end), "Variables": ", ".join(str(cols[j]) for j in end)})
         if progress is not None:
-            progress.progress((i + 1) / len(starts))
+            progress.progress((i + 1) / len(uniq))
 
-    valid = {key: v for key, v in cache.items() if v is not None}
+    ok = steer["ok"] if steer else None
+    valid = {key: v for key, v in cache.items() if v is not None and (ok is None or ok(key))}
     if not valid:
         raise ValueError("No valid models could be fitted from this pool.")
     order = sorted(valid, key=valid.get, reverse=True)
     top = []
-    for rank, key in enumerate(order[:TOP_N], start=1):
+    for r, key in enumerate(order[:TOP_N], start=1):
         names = [cols[i] for i in key]
-        m = run_regression(df, y, names)
-        top.append({"Rank": rank, "Adjusted R Square": float(m.rsquared_adj),
-                    "R Square": float(m.rsquared), "Standard Error": float(np.sqrt(m.mse_resid)),
-                    "Predictors": len(names), "Variables": ", ".join(map(str, names))})
-    check_ok = abs(top[0]["Adjusted R Square"] - valid[order[0]]) < 1e-8
+        top.append(top_row(r, run_regression(df, y, names), names))
+    add_bic_gap(top)
+    fast = valid[order[0]]
+    exact = -top[0]["BIC"] if SEARCH_SCORE == "bic" else top[0]["Adjusted R Square"]
+    check_ok = abs(fast - exact) < 1e-6 * max(1.0, abs(fast))
     return {"mode": "hybrid", "models_run": len(valid), "skipped": len(cache) - len(valid),
-            "scores": np.array(list(valid.values())), "top": top, "pool": list(cols),
-            "max_size": max_size, "check_ok": check_ok, "starts": rows, "distinct_ends": len(ends)}
+            "scores": np.array([adj_cache[key] for key in valid]), "top": top, "pool": list(cols),
+            "max_size": max_size, "check_ok": check_ok, "starts": rows, "distinct_ends": len(ends),
+            "score_name": SEARCH_SCORE}
 
 
 def store_search(res, pick, max_size, recipe):
@@ -1878,6 +2883,262 @@ def store_search(res, pick, max_size, recipe):
     if "starts" in res:
         recipe["search_starts"] = res["starts"]
     recipe["holdout"] = res.get("holdout")
+    recipe["search_score"] = res.get("score_name", SEARCH_SCORE)
+    recipe["cv"] = res.get("cv_info")
+    if res.get("learning"):
+        recipe["batch_learning"] = learning_summary(res["learning"])
+    else:
+        recipe.pop("batch_learning", None)
+    cfg = (res.get("steer") or {}).get("cfg")
+    if cfg:
+        recipe["search_locked"] = cfg["locked"]
+        recipe["search_excluded"] = cfg["excluded"]
+        recipe["search_weights"] = {"favored": cfg["favored"], "favor_multiplier": cfg["favor_multiplier"], "everything_else": 1.0}
+        recipe["search_rules"] = {"one_version_per_family": cfg["one_version_per_family"], "hierarchy": cfg["hierarchy"]}
+
+
+# ---------- Luck benchmark (U1-B) ----------
+LUCK_REPEATS = 5   # shuffled-Y repeats
+LUCK_SEED = 1000   # permutation seeds are LUCK_SEED + repeat number
+
+
+def model_bic(df, y, cols):
+    """(BIC, Adjusted R Square) of one OLS fit, using the same BIC formula as the search."""
+    m = run_regression(df, y, cols)
+    return bic_value(int(m.nobs), float(m.ssr), int(m.df_model)), float(m.rsquared_adj)
+
+
+def luck_benchmark(res, train, base_df, y, base_cols, repeats, progress=None):
+    """Re-run the identical search on training rows with Y shuffled. Gain = BIC of a no-predictor model
+    minus the best BIC found, so real and shuffled gains measure the same thing: how much the search
+    can 'explain' beyond guessing the average. The shuffled searches use the same locks, weights and rules,
+    and a learning search learns on the shuffled data too (plus a learning-off run for comparison)."""
+    learning = res["settings"]["kind"] == "learn"
+
+    def null_gains(r, d):
+        yv = d[y].to_numpy(dtype=float)
+        sst = float(((yv - yv.mean()) ** 2).sum())
+        return bic_value(len(d), sst, 0) - min(t["BIC"] for t in r["top"]), float(r["scores"].max())
+
+    real_bic, real_adj = null_gains(res, train)
+    base_bic, _ = model_bic(base_df, y, base_cols)
+    vs_base = base_bic - min(t["BIC"] for t in res["top"])
+    sh_bic, sh_adj, sh_off = [], [], []
+    for i in range(repeats):
+        perm = np.random.default_rng(LUCK_SEED + i).permutation(train[y].to_numpy())
+        tr = train.copy()
+        tr[y] = perm
+        g_bic, g_adj = null_gains(rerun_search(res, tr, y, base_cols), tr)
+        sh_bic.append(float(g_bic))
+        sh_adj.append(g_adj)
+        if learning and res["settings"]["learn"]:
+            sh_off.append(float(null_gains(rerun_search(res, tr, y, base_cols, learn=False), tr)[0]))
+        if progress is not None:
+            progress.progress((i + 1) / repeats)
+    out = {"real_gain": float(real_bic), "shuffled_gains": sh_bic,
+           "real_gain_adj": float(real_adj), "shuffled_gains_adj": sh_adj,
+           "real_gain_vs_baseline": float(vs_base), "repeats": repeats}
+    if sh_off:
+        out["shuffled_gains_learning_off"] = sh_off
+    return out
+
+
+# ---------- Batch learning and bootstrap stability (U5) ----------
+LEARN_BATCH = 500        # models per batch
+LEARN_ROUNDS = 5         # batches
+LEARN_ETA = 0.3          # how far each round moves a weight toward the new evidence
+LEARN_TOP = 0.10         # the top share of a batch that counts as "the best models"
+LEARN_CLAMP = (0.25, 4.0)
+LEARN_CLIMBS = 5        # after the last batch, hill-climb from the baseline and this many best models found
+BOOT_RUNS = 20           # resampled re-runs in the stability check
+BOOT_SEED = 2000
+
+
+LEARN_SCALE = 5.0 if SEARCH_SCORE == "bic" else 0.001  # a gain this size (BIC points, or Adj R Square) doubles the target weight
+
+
+def marginal_gain(score, models, i, max_size, steer):
+    """Average score gain from having variable i in rather than out of each model (add it if absent, drop it if
+    present), skipping changes that break a lock, the size limit or the rules. None when no change was legal."""
+    ok, locked, gains = steer["ok"], set(steer["locked"]), []
+    for s in models:
+        with_i = tuple(sorted(set(s) | {i}))
+        without = tuple(x for x in s if x != i)
+        if len(with_i) > max_size or not without or (locked - set(without)):
+            continue
+        if ok is not None and not (ok(with_i) and ok(without)):
+            continue
+        a, b = score(with_i), score(without)
+        if a is not None and b is not None:
+            gains.append(a - b)
+    return float(np.mean(gains)) if gains else None
+
+
+def plain_steer(k):
+    """No locks, equal weights, no rules: what the search does when nobody steers it."""
+    return {"locked": (), "weights": np.ones(k), "ok": None, "parents": [[] for _ in range(k)], "cfg": None}
+
+
+def run_learning(df, y, cols, max_size, batch, rounds, learn=True, must=(), progress=None, steer=None):
+    """Batches of (weighted) random models. After each batch, every learnable variable's weight moves toward
+    2 ** (g / LEARN_SCALE), where g = its average score gain from being in rather than out of the batch's best
+    LEARN_TOP models (marginal_gain): new = (1 - LEARN_ETA) * old + LEARN_ETA * target, clamped to LEARN_CLAMP.
+    (The plan's "share among the top models" signal was tried first: it rewarded every variable, because the best
+    models are simply bigger, and it could not raise a variable that was already drawn often.) Locked and user-favored
+    variables keep the user's setting. With learn=False the weights never change (same batches, no learning)."""
+    k = len(cols)
+    steer = steer or plain_steer(k)
+    if len(steer["locked"]) > max_size:
+        raise ValueError("More variables are locked than the model-size limit allows.")
+    favored = set((steer.get("cfg") or {}).get("favored", []))
+    learnable = [i for i in range(k) if i not in steer["locked"] and cols[i] not in favored]
+    shown = [i for i in range(k) if i not in steer["locked"]]
+    score, cache, adj_cache = make_scorer(df, y, cols)
+    base_starts = []
+    for m in must:  # the baseline is always scored, so the leaderboard can be compared with it
+        r = repair(m, steer, max_size) if steer["ok"] or steer["locked"] else tuple(sorted(m))
+        if r and len(r) <= max_size:
+            score(r)
+            base_starts.append(r)
+    w = steer["weights"].astype(float).copy()
+    rng = np.random.default_rng(SEARCH_SEED)
+    history = [{"Round": 0, **{str(cols[i]): float(w[i]) for i in shown}}]
+    best_by_round = []
+    for rd in range(1, rounds + 1):
+        sets = draw_subsets(k, max_size, batch, dict(steer, weights=w), rng)
+        scored = sorted(((score(s), s) for s in sets if score(s) is not None), reverse=True)
+        if scored:
+            best_by_round.append(-scored[0][0] if SEARCH_SCORE == "bic" else scored[0][0])
+        if learn and len(scored) >= 10:
+            top = [s for _, s in scored[:max(10, int(len(scored) * LEARN_TOP))]]
+            for i in learnable:
+                g = marginal_gain(score, top, i, max_size, steer)
+                if g is None:
+                    continue  # no legal way to toggle it in these models: keep its weight
+                target = 2.0 ** float(np.clip(g / LEARN_SCALE, -2, 2))  # +LEARN_SCALE -> 2x, -LEARN_SCALE -> 0.5x
+                w[i] = float(np.clip((1 - LEARN_ETA) * w[i] + LEARN_ETA * target, *LEARN_CLAMP))
+        history.append({"Round": rd, **{str(cols[i]): float(w[i]) for i in shown}})
+        if progress is not None:
+            progress.progress(rd / rounds)
+
+    # Finish like the riff search: climb (best single add / remove / swap) from the baseline and the best models
+    # found, so the learning search cannot end just short of a peak the plain or riff search would reach.
+    ok = steer["ok"]
+    found = sorted((v, key) for key, v in cache.items() if v is not None and (ok is None or ok(key)))[::-1]
+    starts = [("Baseline", b) for b in base_starts] + [(f"Learned #{j}", key) for j, (_, key) in enumerate(found[:LEARN_CLIMBS], 1)]
+    rows, ends, used = [], set(), set()
+    for label, s0 in starts:
+        if s0 in used or score(s0) is None:
+            continue
+        used.add(s0)
+        end, _ = hill_climb(score, k, s0, max_size, steer)
+        ends.add(end)
+        rows.append({"Start": label, "Start Adj R Square": adj_cache[s0], "End Adj R Square": adj_cache[end],
+                     "Predictors": len(end), "Variables": ", ".join(str(cols[j]) for j in end)})
+
+    valid = {key: v for key, v in cache.items() if v is not None and (ok is None or ok(key))}
+    if not valid:
+        raise ValueError("No valid models could be fitted from this pool.")
+    order = sorted(valid, key=valid.get, reverse=True)
+    top_rows = []
+    for r, key in enumerate(order[:TOP_N], start=1):
+        names = [cols[i] for i in key]
+        top_rows.append(top_row(r, run_regression(df, y, names), names))
+    add_bic_gap(top_rows)
+    fast = valid[order[0]]
+    exact = -top_rows[0]["BIC"] if SEARCH_SCORE == "bic" else top_rows[0]["Adjusted R Square"]
+    return {"mode": "learning", "models_run": len(valid), "skipped": len(cache) - len(valid),
+            "scores": np.array([adj_cache[key] for key in valid]), "top": top_rows, "pool": list(cols),
+            "max_size": max_size, "check_ok": abs(fast - exact) < 1e-6 * max(1.0, abs(fast)),
+            "score_name": SEARCH_SCORE, "starts": rows, "distinct_ends": len(ends),
+            "learning": {"history": history, "rounds": rounds, "batch": batch, "learn": learn,
+                         "best_by_round": best_by_round, "fixed": sorted(favored)}}
+
+
+def rerun_search(res, data, y, base_cols, learn=None):
+    """Repeat the search that produced `res` (same kind, settings, pool, size limit and steering) on other rows."""
+    cfg, pick, max_size, steer = res["settings"], res["pool"], res["max_size"], res.get("steer")
+    must = [[pick.index(c) for c in base_cols]] if all(c in pick for c in base_cols) else []
+    if cfg["kind"] == "riff":
+        return run_hybrid(data, y, pick, max_size, cfg["n_rand"], cfg["n_starts"], must, None, steer, cfg.get("plan_start"))
+    if cfg["kind"] == "learn":
+        return run_learning(data, y, pick, max_size, cfg["batch"], cfg["rounds"],
+                            cfg["learn"] if learn is None else learn, must, None, steer)
+    return run_search(data, y, pick, max_size, cfg["sample_n"], None, must, steer)
+
+
+def learning_summary(ln):
+    """Compact record of what the learning search learned (for the recipe and the report)."""
+    final = ln["history"][-1]
+    wts = {k: v for k, v in final.items() if k != "Round" and k not in ln["fixed"]}
+    s = pd.Series(wts, dtype=float).sort_values(ascending=False)
+    return {"rounds": ln["rounds"], "batch": ln["batch"], "learning_on": ln["learn"], "eta": LEARN_ETA,
+            "top_share": LEARN_TOP, "signal": "average BIC change with the variable in vs out of the batch best models", "scale": LEARN_SCALE, "clamp": list(LEARN_CLAMP), "kept_at_user_favor": ln["fixed"],
+            "raised_most": {k: round(v, 2) for k, v in s[s > 1].head(8).items()},
+            "lowered_most": {k: round(v, 2) for k, v in s[s < 1].tail(8).items()},
+            "best_score_by_round": [round(b, 1) for b in ln["best_by_round"]]}
+
+
+def bootstrap_stability(res, train, y, raw, entity_col, base_cols, runs, progress=None):
+    """Re-run the same search on `runs` resampled copies of the training rows (whole entities resampled when an
+    entity column is set). For each variable: share of runs whose winner contains it, and share whose top 5 do."""
+    ents = raw.loc[train.index, entity_col].astype(str).to_numpy() if entity_col else None
+    groups = {e: np.flatnonzero(ents == e) for e in np.unique(ents)} if entity_col else None
+    wins, top5, winners, done = {}, {}, set(), 0
+    for b in range(runs):
+        rng = np.random.default_rng(BOOT_SEED + b)
+        if entity_col:
+            keys = list(groups)
+            idx = np.concatenate([groups[keys[j]] for j in rng.integers(0, len(keys), len(keys))])
+        else:
+            idx = rng.integers(0, len(train), len(train))
+        sample = train.iloc[idx].reset_index(drop=True)
+        try:
+            r = rerun_search(res, sample, y, base_cols)
+        except ValueError:
+            continue
+        done += 1
+        win = r["top"][0]["Variables"].split(", ")
+        winners.add(tuple(sorted(win)))
+        for v in win:
+            wins[v] = wins.get(v, 0) + 1
+        for v in {n for row in r["top"][:5] for n in row["Variables"].split(", ")}:
+            top5[v] = top5.get(v, 0) + 1
+        if progress is not None:
+            progress.progress((b + 1) / runs)
+    if not done:
+        raise ValueError("No resampled run could be fitted.")
+    freq = {c: {"wins": wins.get(c, 0) / done * 100, "top5": top5.get(c, 0) / done * 100} for c in res["pool"]}
+    return {"runs": done, "grouped_by": entity_col or "random rows", "distinct_winners": len(winners), "freq": freq}
+
+
+def learning_fig(history, fixed, top_n=8):
+    """Weight per round for the variables whose weight moved most."""
+    h = pd.DataFrame(history).set_index("Round")
+    h = h[[c for c in h.columns if c not in fixed]]
+    moved = (h.iloc[-1] - 1).abs().sort_values(ascending=False).index[:top_n]
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    for c in moved:
+        ax.plot(h.index, h[c], marker="o", label=str(c))
+    ax.axhline(1, color="#888888", linestyle="--", linewidth=1)
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Draw weight (1 = neutral)")
+    ax.set_title("What the learning search learned")
+    ax.legend(fontsize=6, ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+def luck_verdict(real, shuffled):
+    """(streamlit alert level, plain-English verdict) comparing the real BIC gain with the shuffled gains."""
+    worst_luck = max(shuffled)
+    if real <= 0:
+        return "warning", "**The search found nothing that beats guessing the average.**"
+    if real > 10 and real > 1.5 * worst_luck:
+        return "success", "**The fit is well beyond luck.** The real gain is much larger than anything the search found on shuffled data."
+    if real > worst_luck:
+        return "info", "**Beats luck, but not by a wide margin.** Lean on the holdout and CV numbers."
+    return "warning", "**Indistinguishable from luck.** The search found gains this large on shuffled data, so this fit could be noise."
 
 
 def search_fig(scores, base_adj):
@@ -1893,6 +3154,91 @@ def search_fig(scores, base_adj):
     return fig
 
 
+def single_moves(train, y, base_in, pool):
+    """For each pool column, the one change from the Base Data Model on the training rows: add it
+    (or remove it, if it is a base predictor). Returns {name: Move, Δ BIC, Δ Adj R Square, t Stat}."""
+    cols = list(base_in) + [c for c in pool if c not in base_in]
+    fit = fast_stats(train, y, cols)
+    base = list(range(len(base_in)))
+    b0 = fit(base)
+    out = {}
+    for j, c in enumerate(cols):
+        is_base = j < len(base_in)
+        r = fit([b for b in base if b != j]) if is_base else fit(base + [j])
+        t = (b0["t"][j] if b0 else None) if is_base else (r["t"][-1] if r else None)
+        good = r is not None and b0 is not None
+        out[c] = {"Move": "Remove" if is_base else "Add",
+                  "Δ BIC": r["bic"] - b0["bic"] if good else np.nan,
+                  "Δ Adj R Square": r["adj"] - b0["adj"] if good else np.nan,
+                  "t Stat": float(t) if t is not None else np.nan}
+    return out
+
+
+def show_checkpoint(work, train, y, all_pool, base_cols, recipe, entity_col):
+    """Lock / Favor / Neutral / Exclude per variable, with its one-change evidence beside the control.
+    Returns (pick, steer, info): the columns the search may use, the steering, and the family info."""
+    info = column_info(all_pool, base_cols, recipe.get("feature_plan", []))
+    states = st.session_state.setdefault("var_states", {})
+    for c in all_pool:
+        states.setdefault(c, "Favor" if info[c]["source"] in ("user", "claude") else "Neutral")
+
+    ui.section("Your checkpoint: steer the search",
+               "Set each variable's state with the evidence in view. **Lock** = in every model. **Favor** = drawn more often in random draws. "
+               "**Neutral** = normal. **Exclude** = never tried. Nothing is forced in unless you lock it: BIC still judges every model. "
+               "Skip this and the defaults apply (your own and Claude's plan columns start as Favor).")
+    res = st.session_state.get("search")
+    key = f"steer_{st.session_state.get('pool_version', 0)}_{entity_col}_{st.session_state.get('search_runs', 0)}"
+    snap = st.session_state.get("steer_table")
+    if snap is None or snap[0] != key:  # rebuild only when the evidence changes, so edits are never fed back in
+        base_in = [c for c in base_cols if c in all_pool]
+        ev = single_moves(train, y, base_in, all_pool)
+        share = {}
+        if res:
+            names = [n for r in res["top"] for n in r["Variables"].split(", ")]
+            share = (pd.Series(names).value_counts() / len(res["top"]) * 100).to_dict()
+        boot = (res or {}).get("bootstrap")
+        rows = [{"State": states[c], "Variable": c, "Source": info[c]["source"], "Family": info[c]["family"], **ev[c],
+                 **({"In top models": float(share.get(c, 0.0))} if res else {}),
+                 **({"Resample wins": boot["freq"].get(c, {}).get("wins", 0.0)} if boot else {})} for c in all_pool]
+        snap = (key, pd.DataFrame(rows))
+        st.session_state.steer_table = snap
+    table = snap[1]
+    edited = st.data_editor(
+        table, key=key, hide_index=True,
+        disabled=[c for c in table.columns if c != "State"],
+        column_config={
+            "State": st.column_config.SelectboxColumn("State", options=VAR_STATES, required=True,
+                                                      help="Lock = in every model, Favor = drawn more often, Exclude = never tried"),
+            "Source": st.column_config.TextColumn(help="base = Base Data Model; user, claude or auto = built in the Stage 4 plan"),
+            "Family": st.column_config.TextColumn(help="x, ln1p_x and x_sq share a family"),
+            "Move": st.column_config.TextColumn("One change", help="Add it to the Base Data Model, or remove it if it is already in"),
+            "Δ BIC": st.column_config.NumberColumn(format="%+.1f", help="Below 0 = that one change helps (below about −10 is strong evidence)"),
+            "Δ Adj R Square": st.column_config.NumberColumn(format="%+.4f"),
+            "t Stat": st.column_config.NumberColumn(format="%.2f", help="The term's t Stat in that model; beyond about ±2 is unlikely to be chance"),
+            "In top models": st.column_config.NumberColumn(format="%.0f%%", help="Share of the last run's leaderboard models that contain it"),
+            "Resample wins": st.column_config.NumberColumn(format="%.0f%%", help="Share of the stability check's resampled runs whose winner contains it"),
+        },
+    )
+    for c, v in zip(edited["Variable"], edited["State"]):
+        states[c] = v or "Neutral"
+    st.caption("The evidence columns are one change at a time from your Base Data Model on these training rows. "
+               + ("**In top models** is from the last run: a variable in nearly all of them is robustly useful; re-weight and run again to test that." if res else
+                  "After a run, an **In top models** column shows how often each variable made the leaderboard."))
+
+    c1, c2, c3 = st.columns(3)
+    mult = c1.slider("Favor multiplier", 1.0, 10.0, FAVOR_MULT, 0.5, key="favor_multiplier",
+                     help="How many times as often a Favor variable is drawn in random models. It never changes a model's score.")
+    one_fam = c2.checkbox("One version per family", value=True, key="rule_family",
+                          help="A model uses x or ln1p_x, not both. x_sq may sit beside x (that pair is how curvature is fit).")
+    hier = c3.checkbox("Hierarchy rule", value=False, key="rule_hierarchy",
+                       help="A square or interaction is only tried when its parent columns are also in the model.")
+    pick = [c for c in all_pool if states[c] != "Exclude"]
+    steer = build_steer(pick, states, info, mult, one_fam, hier)
+    n = {s: sum(states[c] == s for c in all_pool) for s in VAR_STATES}
+    st.caption(f"{n['Lock']} locked, {n['Favor']} favored, {n['Neutral']} neutral, {n['Exclude']} excluded. "
+               "Weights only change how often a variable is drawn in sampled and riff searches; a full search tries every allowed model anyway.")
+    return pick, steer, info
+
 
 def show_stage_5():
     result = st.session_state.clean
@@ -1903,16 +3249,8 @@ def show_stage_5():
     y = recipe["target"]
     all_pool = recipe["pool_columns"]
 
-    ui.section("Pool & Search", "The app fits many models from different subsets of your pool and ranks them by Adjusted R Square. Python does the search; you decide what the results mean.")
+    ui.section("Pool & Search", "The app fits many models from different subsets of your pool and ranks them by BIC (a fit score that charges for extra predictors). Adjusted R Square stays on screen so numbers match Excel. Python does the search; you steer it and decide what the results mean.")
     strip = st.container()  # filled in below, once the controls are set
-
-    # --- Pool ---
-    pick = st.multiselect("Variables in the search pool (roughly 10 to 20 works best)", all_pool,
-                          default=all_pool, key=f"pool_pick_{st.session_state.get('pool_version', 0)}")
-    k = len(pick)
-    if k == 0:
-        st.warning("Pick at least one variable.")
-        return
 
     # --- Holdout ---
     df_clean, raw = result["df"], result["raw"]
@@ -1935,36 +3273,62 @@ def show_stage_5():
                    "If the holdout spread is larger, holdout R Square gets a boost that is not real skill.")
     base_adj = run_regression(df_clean.loc[train.index], y, base_cols).rsquared_adj
 
+    # --- Checkpoint (replaces the old pool picker: Exclude removes a variable from the pool) ---
+    pick, steer, info = show_checkpoint(work, train, y, all_pool, base_cols, recipe, entity_col)
+    k, n_locked = len(pick), len(steer["locked"])
+    if k == 0:
+        st.warning("Every variable is excluded. Set at least one to Neutral, Favor or Lock.")
+        return
+
     # --- Search settings ---
     cap = min(k, len(train) - 2)
-    max_size = st.slider("Largest model to test (number of predictors)", 1, cap, cap) if cap > 1 else 1
-    total = count_subsets(k, max_size)
+    if n_locked > cap:
+        st.error(f"{n_locked} variables are locked, more than the largest model allowed ({cap}). Unlock some.")
+        return
+    lo = max(1, n_locked)
+    max_size = st.slider("Largest model to test (number of predictors)", lo, cap, cap) if cap > lo else cap
+    total = count_subsets(k, max_size, n_locked)
+    rules_on = steer["ok"] is not None
     sample_n = 0
     if total <= FULL_LIMIT:
-        st.write(f"{total:,} possible models, so **every** one will be run.")
+        st.write(f"{total:,} possible models, so **every** one will be run" + (" (minus those the family or hierarchy rule forbids)." if rules_on else "."))
     else:
-        st.write(f"{total:,} possible models, too many to run all, so a **random sample** will be tested.")
+        st.write(f"{total:,} possible models, too many to run all, so a **random sample** will be tested" + (", favored variables drawn more often." if steer["cfg"]["favored"] else "."))
         sample_n = st.number_input("Sample size", 500, 50000, DEFAULT_SAMPLE, step=500)
 
     with strip:
         ui.metric_strip([
-            ("Variables in pool", f"{k}", "Predictors the search can choose from."),
+            ("Variables in pool", f"{k}", f"Predictors the search can choose from ({n_locked} locked into every model)." if n_locked else "Predictors the search can choose from."),
             ("Training rows", f"{len(train):,}", "The only rows the search sees."),
             ("Holdout rows", f"{len(test):,}", "Set aside to test the winner on unseen data."),
             ("Possible models", f"{total:,}",
-             "Every subset up to the size limit." if total <= FULL_LIMIT else "Too many to run all, so a random sample is tested."),
+             "Every subset up to the size limit, with locked variables always in." if total <= FULL_LIMIT else "Too many to run all, so a random sample is tested."),
         ])
 
     # --- Run buttons ---
+    base_in_pool = all(c in pick for c in base_cols)
+    must = [[pick.index(c) for c in base_cols]] if base_in_pool else []
+    baseline_testable = base_in_pool and repair(must[0], steer, max_size) == tuple(sorted(must[0]))
+    plan_cols = [c for c in pick if info[c]["source"] not in ("base", "data")]
+    plan_start = ([pick.index(c) for c in plan_cols] + [pick.index(c) for c in base_cols if c in pick]) if plan_cols else None
+
+    def finish(res, settings):
+        res["baseline_testable"] = baseline_testable
+        res["settings"] = settings
+        res["steer"] = steer
+        attach_holdout(res, work, df_clean, mask, y, base_cols, entity_col)
+        store_search(res, pick, max_size, recipe)
+        recipe.pop("luck_benchmark", None)  # a new search invalidates any earlier luck run
+        recipe.pop("bootstrap_stability", None)
+        st.session_state.search_runs = st.session_state.get("search_runs", 0) + 1
+
+    ran = False
     if st.button("Run search", type="primary"):
         bar = st.progress(0.0)
         try:
-            base_in_pool = all(c in pick for c in base_cols)
-            must = [[pick.index(c) for c in base_cols]] if base_in_pool else []
-            res = run_search(train, y, pick, max_size, int(sample_n), bar, must)
-            res["baseline_testable"] = base_in_pool
-            attach_holdout(res, work, df_clean, mask, y, base_cols, entity_col)
-            store_search(res, pick, max_size, recipe)
+            finish(run_search(train, y, pick, max_size, int(sample_n), bar, must, steer),
+                   {"kind": "search", "sample_n": int(sample_n)})
+            ran = True
         except Exception as e:
             st.error(f"Search failed: {e}")
         bar.empty()
@@ -1973,39 +3337,67 @@ def show_stage_5():
         r1, r2 = st.columns(2)
         n_rand = r1.number_input("Random models to scout starting points", 200, 20000, 2000, step=200)
         n_starts = r2.number_input("Random starting points to riff from", 0, 50, 10)
+        st.caption("Climbs start from the baseline, " + ("**Your plan** (your Stage 4 columns plus the base), " if plan_start else "")
+                   + "the full pool when it fits, and the best random scouts. Locked variables stay in every climb.")
         if st.button("Run riff search"):
             bar = st.progress(0.0)
             try:
-                base_in_pool = all(c in pick for c in base_cols)
-                must = [[pick.index(c) for c in base_cols]] if base_in_pool else []
-                res = run_hybrid(train, y, pick, max_size, int(n_rand), int(n_starts), must, bar)
-                res["baseline_testable"] = base_in_pool
-                attach_holdout(res, work, df_clean, mask, y, base_cols, entity_col)
-                store_search(res, pick, max_size, recipe)
+                finish(run_hybrid(train, y, pick, max_size, int(n_rand), int(n_starts), must, bar, steer, plan_start),
+                       {"kind": "riff", "n_rand": int(n_rand), "n_starts": int(n_starts), "plan_start": plan_start})
+                ran = True
             except Exception as e:
                 st.error(f"Search failed: {e}")
             bar.empty()
+    with st.expander("Learning search (optional): run batches of models, and between batches draw the variables that keep helping more often"):
+        l1, l2, l3 = st.columns(3)
+        batch = l1.number_input("Models per batch", 100, 5000, LEARN_BATCH, step=100)
+        rounds = l2.number_input("Rounds", 1, 20, LEARN_ROUNDS)
+        learn_on = l3.checkbox("Learning on", value=True, key="learn_on",
+                               help="Off = the same batches with your weights held fixed, for comparison.")
+        st.caption(f"After each batch, Python takes the best {LEARN_TOP:.0%} of that batch's models and checks, for each variable, how much the score changes with it in versus out. "
+                   f"Variables that help get drawn more often in the next batch, and ones that hurt get drawn less (step {LEARN_ETA}, weights kept between {LEARN_CLAMP[0]} and {LEARN_CLAMP[1]}). "
+                   "Your Lock, Favor and Exclude settings always win over learned weights. "
+                   f"After the last batch it climbs one change at a time from the baseline and the {LEARN_CLIMBS} best models found, like the riff search. "
+                   "Weights only change what gets tried; BIC still judges every model. Learning can chase early luck, so check the luck benchmark afterwards: it learns on shuffled data too.")
+        if st.button("Run learning search"):
+            bar = st.progress(0.0)
+            try:
+                finish(run_learning(train, y, pick, max_size, int(batch), int(rounds), learn_on, must, bar, steer),
+                       {"kind": "learn", "batch": int(batch), "rounds": int(rounds), "learn": bool(learn_on)})
+                ran = True
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+            bar.empty()
+    if ran:
+        st.rerun()  # redraw the checkpoint table with the new "In top models" column
 
     res = st.session_state.get("search")
     if res is None:
         return
-    stale = res["pool"] != pick or res["max_size"] != max_size or (res.get("holdout") or {}).get("entity_column") != entity_col
+    stale = (res["pool"] != pick or res["max_size"] != max_size
+             or (res.get("holdout") or {}).get("entity_column") != entity_col
+             or (res.get("steer") or {}).get("cfg") != steer["cfg"])
     if stale:
-        st.warning("The pool, model-size limit, or holdout setting changed since the last run. Run the search again.")
+        st.warning("The pool, model-size limit, holdout setting, or checkpoint (locks, favors, rules) changed since the last run. Run the search again.")
 
     # --- Results ---
     st.divider()
     s = res["scores"]
+    top1 = res["top"][0]
     how = {"all": "every possible model", "sample": "a random sample of models",
-           "hybrid": "random scouting plus riffing from promising starts"}[res["mode"]]
+           "hybrid": "random scouting plus riffing from promising starts",
+           "learning": "batches of random models, reweighted between batches"}[res["mode"]]
     ui.section("Search results", f"Ran {res['models_run']:,} models ({how}); skipped {res['skipped']:,} that could not be fitted.")
     if not res.get("baseline_testable", True):
         st.info("Some Base Data Model predictors are not in this pool (dropped in Stage 4 or removed above), so no tested model reproduces the baseline exactly. The best model can legitimately score below it.")
     if not res["check_ok"]:
         st.error("The fast scorer disagreed with statsmodels for the top model. Do not trust this search; please report it.")
 
+    by_bic = res.get("score_name") == "bic"
     ui.metric_strip([
-        ("Best model", f"{s.max():.4f}", "Highest Adjusted R Square found.", f"{s.max() - base_adj:+.4f} vs baseline"),
+        ("Leaderboard #1", f"{top1['Adjusted R Square']:.4f}",
+         f"Adjusted R Square of the model ranked first by {'BIC' if by_bic else 'Adjusted R Square'}. The highest Adjusted R Square among all models tested was {s.max():.4f}.",
+         f"{top1['Adjusted R Square'] - base_adj:+.4f} vs baseline"),
         ("Average", f"{s.mean():.4f}", "Mean Adjusted R Square of the models tested."),
         ("Worst", f"{s.min():.4f}", "Lowest Adjusted R Square of the models tested."),
         ("Baseline", f"{base_adj:.4f}", "Your Base Data Model, fit on the training rows."),
@@ -2017,12 +3409,19 @@ def show_stage_5():
 
     # --- Leaderboard ---
     st.divider()
-    ui.section("Leaderboard", f"Top {len(res['top'])} models by Adjusted R Square.")
+    ui.section("Leaderboard", f"Top {len(res['top'])} models, ranked by {'BIC (lower is better)' if by_bic else 'Adjusted R Square'}.")
     lb = pd.DataFrame(res["top"])
     lb = lb[[c for c in lb.columns if c != "Variables"] + ["Variables"]]
     fmt = {c: "{:.4f}" for c in ["Adjusted R Square", "R Square", "Holdout R Square", "Shrinkage"] if c in lb}
-    fmt.update({c: "{:.3f}" for c in ["Standard Error", "Holdout Error (RMSE)", "Error Ratio"] if c in lb})
-    st.dataframe(lb.style.format(fmt), use_container_width=True, hide_index=True)
+    fmt.update({c: "{:.3f}" for c in ["Standard Error", "Holdout Error (RMSE)", "Error Ratio", "CV RMSE", "CV RMSE SE"] if c in lb})
+    fmt.update({c: "{:.1f}" for c in ["BIC", "BIC Gap"] if c in lb})
+    st.dataframe(lb.style.format(fmt), hide_index=True)
+    cvi = res.get("cv_info")
+    st.caption("**BIC** is a fit score that charges extra for every predictor, so it favors simpler models than Adjusted R Square. "
+               "**BIC Gap** is how far a model sits above the best BIC; a gap above about 10 is conventionally strong evidence it is worse. "
+               + (f"**CV RMSE** is the typical miss when the model is refit {cvi['folds']} times, each time predicting a slice of the training rows it did not see "
+                  f"(slices grouped by {cvi['grouped_by']}); **CV RMSE SE** is how much that estimate wobbles between slices. "
+                  "Models whose CV RMSE differ by less than the SE are effectively tied. " if cvi else ""))
     st.caption("Winner's curse: the best of thousands of models looks better than it will on new data, partly by luck. Treat the winner as a strong candidate, not a proven result. Many of the top models differ by tiny amounts, so look at the whole top group, not just rank 1.")
 
     with st.expander("How often does each variable appear in the top models?"):
@@ -2031,13 +3430,11 @@ def show_stage_5():
         freq_df = pd.DataFrame({"Models containing it": freq,
                                 "Share of top models": freq / len(res["top"]) * 100})
         st.dataframe(freq_df.style.format({"Models containing it": "{:,.0f}", "Share of top models": "{:.0f}%"})
-                     .background_gradient(subset=["Share of top models"], cmap="Oranges"),
-                     use_container_width=True)
+                     .background_gradient(subset=["Share of top models"], cmap="Oranges"))
         st.caption(f"Counts only the {len(res['top'])} leaderboard models. A variable in nearly all of them is robustly useful. One that appears in only a few may owe its place to luck.")
 
     # --- Holdout check ---
     h = res.get("holdout")
-    top1 = res["top"][0]
     if h and "Holdout R Square" in top1:
         st.divider()
         ui.section("Holdout check: winner vs baseline",
@@ -2054,21 +3451,129 @@ def show_stage_5():
         ui.metric_strip(items)
         how_to_read("holdout")
 
-    # --- Riff starts ---
+    # --- How much to trust this ---
+    st.divider()
+    ui.section("How much to trust this",
+               "Three honest yardsticks: error on rows the model never saw, error from guessing the average, and how much of the improvement shuffled (meaningless) data can fake.")
+    err_items = []
+    if "CV RMSE" in top1:
+        err_items.append(("Winner CV RMSE", f"{top1['CV RMSE']:.3f}",
+                          f"Typical miss in cross-validation on training rows (wobble between folds: {top1.get('CV RMSE SE', float('nan')):.3f})."))
+    if "Holdout Error (RMSE)" in top1:
+        err_items.append(("Winner holdout RMSE", f"{top1['Holdout Error (RMSE)']:.3f}", "Typical miss on the held-out rows."))
+    if cvi:
+        err_items.append(("Predict-the-mean RMSE", f"{cvi['mean_guess_rmse']:.3f}",
+                          "Typical miss if you always guessed the average Y. The model should be well below this."))
+    if err_items:
+        ui.metric_strip(err_items)
+        st.caption("If CV RMSE and holdout RMSE are close to each other and well below the predict-the-mean RMSE, the model genuinely predicts. "
+                   "If they sit near the predict-the-mean value, the fit is mostly an illusion.")
+
+    st.markdown("**Luck benchmark**")
+    st.caption("Shuffles Y (breaking any real link to the predictors), then repeats this exact search and measures how much BIC improvement it still finds over the baseline. "
+               "That is the improvement you can get from luck alone. Each repeat is a full search, so large pools take a while: lower the repeats to go faster.")
+    repeats = st.number_input("Shuffled-Y repeats", 1, 20, LUCK_REPEATS)
+    if st.button("Run luck benchmark", disabled=stale):
+        bar = st.progress(0.0)
+        try:
+            res["luck"] = luck_benchmark(res, train, df_clean.loc[train.index], y, base_cols, int(repeats), bar)
+            recipe["luck_benchmark"] = res["luck"]
+        except Exception as e:
+            st.error(f"Luck benchmark failed: {e}")
+        bar.empty()
+    lk = res.get("luck")
+    if lk:
+        level, text = luck_verdict(lk["real_gain"], lk["shuffled_gains"])
+        getattr(st, level)(text)
+        ui.metric_strip([
+            ("Real BIC gain", f"{lk['real_gain']:.1f}", "BIC of a no-predictor model minus the best BIC found. Bigger means the model explains more than guessing the average."),
+            ("Shuffled gain (average)", f"{np.mean(lk['shuffled_gains']):.1f}", f"Same measure, averaged over {lk['repeats']} searches on shuffled Y."),
+            ("Shuffled gain (largest)", f"{max(lk['shuffled_gains']):.1f}", "The biggest fit luck alone produced."),
+            ("Best Adj R Square, real", f"{lk['real_gain_adj']:.4f}", "Highest Adjusted R Square tested on the real data.",
+             f"shuffled avg {np.mean(lk['shuffled_gains_adj']):.4f}"),
+        ])
+        if lk.get("shuffled_gains_learning_off"):
+            st.caption(f"Learning search: on shuffled data, learning on found an average gain of {np.mean(lk['shuffled_gains']):.1f}; "
+                       f"the same batches with learning off found {np.mean(lk['shuffled_gains_learning_off']):.1f}. "
+                       "If learning on is clearly higher on shuffled data, learning is partly chasing luck.")
+        st.caption(f"Versus your own baseline, the best model gains {lk['real_gain_vs_baseline']:.1f} BIC and "
+                   f"{s.max() - base_adj:+.4f} Adjusted R Square. A small number here means the search mostly confirmed your Base Data Model "
+                   "(BIC rewards dropping predictors that add nothing), not that it found something new.")
+    ln = res.get("learning")
+    if ln:
+        st.divider()
+        ui.section("What the learning search learned",
+                   f"{ln['rounds']} rounds of up to {ln['batch']:,} models; learning {'on' if ln['learn'] else 'off (weights held fixed)'}.")
+        bests = ln["best_by_round"]
+        if bests:
+            unit = "BIC" if res.get("score_name") == "bic" else "Adj R Square"
+            ui.metric_strip([
+                ("Best in round 1", f"{bests[0]:,.1f}" if unit == "BIC" else f"{bests[0]:.4f}", f"Best {unit} in the first batch."),
+                ("Best in last round", f"{bests[-1]:,.1f}" if unit == "BIC" else f"{bests[-1]:.4f}", f"Best {unit} in the final batch. Lower BIC is better."),
+                ("Models tried", f"{res['models_run']:,}", "Distinct models across all batches."),
+                ("Weights kept by you", f"{len(ln['fixed'])}", "Favor variables keep your multiplier; locked ones are always in."),
+            ])
+        if ln["learn"] and len(ln["history"]) > 1:
+            fig = learning_fig(ln["history"], ln["fixed"])
+            st.pyplot(fig)
+            plt.close(fig)
+        with st.expander("Weight history, every variable and round"):
+            hist = pd.DataFrame(ln["history"]).set_index("Round").T
+            hist = hist.sort_values(hist.columns[-1], ascending=False)
+            st.dataframe(hist.style.format("{:.2f}").background_gradient(cmap="Oranges", axis=None))
+            st.caption("1.00 = neutral. Above 1 = drawn more often in the next batch, below 1 = less often. "
+                       "A variable that rises every round keeps appearing in the best models; one that sinks rarely helps.")
+
+    # --- Stability check ---
+    st.divider()
+    ui.section("Stability check (bootstrap)",
+               "Re-runs this exact search on resampled copies of the training rows" + (f" (whole {entity_col} groups resampled)" if entity_col else "")
+               + " and counts how often each variable is in the winner. A variable that wins in most runs is robust; one that wins rarely may owe its place to luck. "
+               "Each run is a full search, so this takes a while.")
+    runs = st.number_input("Resampled runs", 5, 50, BOOT_RUNS)
+    if st.button("Run stability check", disabled=stale):
+        bar = st.progress(0.0)
+        done = False
+        try:
+            res["bootstrap"] = bootstrap_stability(res, train, y, raw, entity_col, base_cols, int(runs), bar)
+            bs_ = res["bootstrap"]
+            recipe["bootstrap_stability"] = {"runs": bs_["runs"], "grouped_by": bs_["grouped_by"], "distinct_winners": bs_["distinct_winners"],
+                                             "winner_share_pct": {c: round(v["wins"]) for c, v in sorted(bs_["freq"].items(), key=lambda kv: -kv[1]["wins"]) if v["wins"] > 0}}
+            st.session_state.search_runs = st.session_state.get("search_runs", 0) + 1
+            done = True
+        except Exception as e:
+            st.error(f"Stability check failed: {e}")
+        bar.empty()
+        if done:
+            st.rerun()  # show the "Resample wins" column in the checkpoint table
+    bs = res.get("bootstrap")
+    if bs:
+        fr = pd.DataFrame(bs["freq"]).T.rename(columns={"wins": "In the winner", "top5": "In a top-5 model"})
+        fr = fr.sort_values(["In the winner", "In a top-5 model"], ascending=False)
+        ui.metric_strip([
+            ("Runs completed", f"{bs['runs']}", f"Resampled by {bs['grouped_by']}."),
+            ("Robust (80%+ of winners)", f"{int((fr['In the winner'] >= 80).sum())}", "Variables in the winner of at least 80% of runs."),
+            ("Fragile (under 20%)", f"{int(((fr['In the winner'] > 0) & (fr['In the winner'] < 20)).sum())}", "Variables that won sometimes, but rarely."),
+            ("Distinct winning models", f"{bs['distinct_winners']}", "How many different models came out on top. Fewer means a more stable answer."),
+        ])
+        with st.expander("Selection frequency for every variable"):
+            st.dataframe(fr.style.format("{:.0f}%").background_gradient(cmap="Oranges", vmin=0, vmax=100))
+            st.caption("Bootstrap runs see slightly different data each time, the way a new sample would. These shares are also in the checkpoint table, "
+                       "so you can lock robust variables or exclude fragile ones and run again.")
+
     if res.get("starts"):
         st.divider()
         ui.section("Where each starting point ended up")
         st.dataframe(pd.DataFrame(res["starts"]).style.format(
-            {"Start Adj R Square": "{:.4f}", "End Adj R Square": "{:.4f}"}),
-            use_container_width=True, hide_index=True)
+            {"Start Adj R Square": "{:.4f}", "End Adj R Square": "{:.4f}"}), hide_index=True)
         st.caption(f"{len(res['starts'])} starts reached {res['distinct_ends']} distinct final model(s). "
+                   "Each climb is guided by BIC; the Adjusted R Square columns are shown for reference, so a climb can end at a lower Adjusted R Square than it started. "
                    "One distinct model means riffing alone finds the peak. Several means there are multiple peaks, so add more random starting points. "
                    "Note: Average and Worst now describe the models explored, not a random draw, because riffing mostly visits good models.")
 
     st.divider()
     notes_box("Analyst notes (which models look sensible to you, and why)", "notes_stage5")
     st.button("Approve search results →", on_click=approve_stage, args=(4,), disabled=stale, type="primary")
-
 
 
 
@@ -2113,9 +3618,8 @@ def write_df(ws, data, row, index=True, max_rows=None):
         d = d.head(max_rows)
     for j, c in enumerate(d.columns, start=1):
         ws.cell(row=row, column=j, value=(str(c) or None)).font = Font(bold=True)
-    for i, rec in enumerate(d.itertuples(index=False, name=None), start=row + 1):
-        for j, v in enumerate(rec, start=1):
-            ws.cell(row=i, column=j, value=xl_val(v))
+    for rec in d.itertuples(index=False, name=None):
+        ws.append([xl_val(v) for v in rec])  # appends below the header just written (about twice as fast as cell by cell)
     return row + len(d) + 2
 
 
@@ -2233,6 +3737,8 @@ def build_workbook(result, recipe, base_m, win_m, mask, win_cols, report_text, s
     notes = {k: v for k, v in recipe.get("analyst_notes", {}).items() if v.strip()}
     r = put_title(ws, r, "Analyst notes")
     r = put_lines(ws, r, [f"{k.replace('notes_stage', 'Stage ')}: {v}" for k, v in notes.items()] or ["(none written)"], wrap=True)
+    r = put_title(ws, r, "Data audit")
+    r = put_lines(ws, r, audit_lines(recipe.get("audit")), wrap=True)
     r = put_title(ws, r, "Changes from the base model")
     ch = pd.DataFrame(fm["changes_from_base"])
     if ch.empty:
@@ -2240,7 +3746,7 @@ def build_workbook(result, recipe, base_m, win_m, mask, win_cols, report_text, s
     else:
         r = write_df(ws, ch, r, index=False)
     r = put_title(ws, r, "Limitations and next steps (flagged by the automatic checks)")
-    gaps = [g for g in KNOWN_GAPS if not g.startswith("Panel data") or recipe.get("dropped_high_cardinality")]
+    gaps = known_gaps(recipe)
     r = put_lines(ws, r, [t.replace("**", "") for t in fm["health_notes"]] or ["No major issues flagged by the automatic checks."], wrap=True)
     r = put_title(ws, r, "Known gaps in this app")
     put_lines(ws, r, gaps, wrap=True)
@@ -2260,13 +3766,37 @@ def build_workbook(result, recipe, base_m, win_m, mask, win_cols, report_text, s
         r = write_df(ws, anova, r)
         r = put_title(ws, r, f"{label}: Coefficients")
         r = write_df(ws, coef, r)
+    cl = fm.get("cluster_robust")
+    if cl:
+        r = put_title(ws, r, f"Selected model: clustered standard errors (by {cl['cluster_column']}, {cl['clusters']} groups)")
+        r = put_lines(ws, r, ["Same coefficients; standard errors and p-values allow for repeated rows from the same entity. Excel's ToolPak cannot produce these."])
+        r = write_df(ws, pd.DataFrame(cl["table"]).T, r)
 
     # ---- 3. Leaderboard ----
     ws = wb.create_sheet("Leaderboard")
-    r = put_lines(ws, 1, [
-        f"Top {len(recipe['leaderboard'])} models by Adjusted R Square (fit on training rows).",
+    by = recipe.get("search_score")
+    notes_lb = [
+        f"Top {len(recipe['leaderboard'])} models, ranked by {'BIC (lower is better)' if by == 'bic' else 'Adjusted R Square'} (fit on training rows).",
+        "BIC Gap = distance from the best BIC. CV RMSE and CV RMSE SE come from cross-validation on the training rows only.",
         "Holdout columns report out-of-sample performance. Do not re-pick the winner by holdout score.",
-    ])
+    ]
+    lk = recipe.get("luck_benchmark")
+    if lk:
+        notes_lb.append(f"Luck benchmark ({lk['repeats']} shuffled-Y repeats): real BIC gain {lk['real_gain']:.1f}; "
+                        "shuffled BIC gains " + ", ".join(f"{g:.1f}" for g in lk["shuffled_gains"]) + ".")
+    ose = fm.get("one_se_rule")
+    if ose:
+        notes_lb.append(f"One-standard-error rule: rank {ose['rank']} ({ose['predictors']} predictors) is the simplest model whose CV RMSE "
+                        f"({ose['cv_rmse']:.3f}) is within one SE of the best ({ose['best_cv_rmse']:.3f} + {ose['best_cv_se']:.3f}).")
+    bl = recipe.get("batch_learning")
+    if bl:
+        notes_lb.append(f"Learning search: {bl['rounds']} rounds of {bl['batch']} models, learning {'on' if bl['learning_on'] else 'off'}. "
+                        "Raised most: " + (", ".join(f"{k} {v}" for k, v in bl["raised_most"].items()) or "none") + ".")
+    bs = recipe.get("bootstrap_stability")
+    if bs:
+        notes_lb.append(f"Stability check: {bs['runs']} resampled runs (by {bs['grouped_by']}), {bs['distinct_winners']} distinct winners. Share of winners containing: "
+                        + ", ".join(f"{k} {v}%" for k, v in list(bs["winner_share_pct"].items())[:12]) + ".")
+    r = put_lines(ws, 1, notes_lb)
     write_df(ws, pd.DataFrame(recipe["leaderboard"]), r, index=False)
 
     # ---- 4. Data Picture ----
@@ -2364,6 +3894,60 @@ def model_metrics(train, test, y, names):
                "Error Ratio": h["holdout_rmse"] / se}
 
 
+def cluster_table(m, index, raw, cluster_col):
+    """Refit the same OLS with cluster-robust standard errors (groups = cluster_col), t-based with G - 1 df.
+    Coefficients are identical; only the standard errors, p-values and confidence intervals change."""
+    groups = pd.factorize(raw.loc[index, cluster_col].astype(str))[0]
+    mc = m.model.fit(cov_type="cluster", cov_kwds={"groups": groups}, use_t=True)
+    ci = mc.conf_int(alpha=ALPHA)
+    t = pd.DataFrame({"Coefficient": m.params, "Plain SE": m.bse, "Plain p": m.pvalues,
+                      "Clustered SE": mc.bse, "Clustered p": mc.pvalues,
+                      f"Clustered lower {CONF_LEVEL}%": ci[0], f"Clustered upper {CONF_LEVEL}%": ci[1]})
+    t["SE ratio"] = t["Clustered SE"] / t["Plain SE"]
+    t.index = ["Intercept" if i == "const" else str(i) for i in t.index]
+    return t, int(groups.max() + 1)
+
+
+def cluster_summary(t, n_groups, col):
+    """Compact numbers for the recipe, the report and the Excel sheet."""
+    v = t.drop(index="Intercept", errors="ignore")
+    return {"cluster_column": col, "clusters": n_groups,
+            "median_se_ratio": float(v["SE ratio"].median()) if len(v) else None,
+            "significant_plain": int((v["Plain p"] < ALPHA).sum()), "significant_clustered": int((v["Clustered p"] < ALPHA).sum()),
+            "lost_significance": [str(i) for i in v.index[(v["Plain p"] < ALPHA) & (v["Clustered p"] >= ALPHA)]],
+            "table": {str(i): {k: float(r[k]) for k in ("Coefficient", "Plain SE", "Plain p", "Clustered SE", "Clustered p")}
+                      for i, r in t.iterrows()}}
+
+
+def one_se_pick(top):
+    """One-standard-error rule: among leaderboard models with CV, the simplest whose CV RMSE is within one SE of the
+    lowest CV RMSE (ties broken by lower CV RMSE). None when CV is missing."""
+    cv = [r for r in top if r.get("CV RMSE") is not None and r.get("CV RMSE SE") is not None]
+    if not cv:
+        return None
+    best = min(cv, key=lambda r: r["CV RMSE"])
+    limit = best["CV RMSE"] + best["CV RMSE SE"]
+    pick = min((r for r in cv if r["CV RMSE"] <= limit), key=lambda r: (r["Predictors"], r["CV RMSE"]))
+    return {"rank": int(pick["Rank"]), "predictors": int(pick["Predictors"]), "cv_rmse": float(pick["CV RMSE"]),
+            "best_rank": int(best["Rank"]), "best_cv_rmse": float(best["CV RMSE"]), "best_cv_se": float(best["CV RMSE SE"]),
+            "limit": float(limit), "within": [int(r["Rank"]) for r in cv if r["CV RMSE"] <= limit]}
+
+
+def known_gaps(recipe):
+    """KNOWN_GAPS adjusted to what this run actually did."""
+    cl = (recipe.get("final_model") or {}).get("cluster_robust")
+    out = []
+    for g in KNOWN_GAPS:
+        if g.startswith("Panel data"):
+            if cl:
+                g = (f"Clustered standard errors (by {cl['cluster_column']}, {cl['clusters']} groups) are shown for the selected model only; "
+                     "the search, BIC, cross-validation and the ToolPak tables still use ordinary standard errors.")
+            elif not recipe.get("dropped_high_cardinality"):
+                continue
+        out.append(g)
+    return out
+
+
 def compare_table(base_m, win_m, base_cols, win_cols):
     """Every variable in either model, marked Kept, Added, or Removed."""
     rows = []
@@ -2451,11 +4035,11 @@ def changes_table(plan, base_cols, win_cols):
 
 
 KNOWN_GAPS = [
-    "Panel data is flagged but not corrected (no clustered standard errors).",
+    "Panel data is flagged but not corrected (no clustered standard errors were computed for this run).",
     "No robust standard errors for unequal spread.",
     "Linear OLS only; curvature is handled only through log and square terms.",
     "The holdout is one split, so its score is itself noisy.",
-    "Median imputation was used for missing predictor values.",
+    "Median imputation was used for missing predictor values. The medians use all rows, including the holdout rows, which is a small leak.",
     "Post-selection inference: the selected model was chosen from many tested models, so its p-values and confidence intervals are optimistic; the holdout results are the more honest check."
 ]
 
@@ -2465,14 +4049,25 @@ REPORT_SYSTEM = (
     "a selected model, and a holdout check. Write a plain-English report with these short sections: "
     "1) Summary: what was predicted, the base model vs the selected model (Adjusted R Square, standard error, holdout R Square, error ratio). "
     "2) Exact changes from the base model: list every added and removed variable with its formula and reason, so anyone can reproduce it. "
-    "3) How much to trust it: how many models were searched (state the number), winner's curse, shrinkage on the holdout, "
-    "and whether near-tied runners-up are simpler. "
+    "3) How much to trust it: how many models were searched (state the number); that models were ranked by BIC "
+    "(a fit score that penalizes extra predictors; a BIC gap above about 10 is strong evidence a model is worse); "
+    "the selected model's cross-validation RMSE and its standard error compared with the holdout RMSE and the predict-the-mean RMSE; "
+    "the luck benchmark (the improvement found when Y is shuffled, versus the real improvement; if luck_benchmark is null, say it was not run); "
+    "winner's curse; shrinkage on the holdout; and whether near-tied runners-up are simpler. "
+    "If one_standard_error_rule is present, say which leaderboard model it suggests (the simplest whose CV RMSE is within one standard error of the best) "
+    "and whether the selected model is that one. If selected_model_cluster_robust is present, explain that clustered standard errors allow for "
+    "repeated rows from the same entity, give the median SE ratio, and name any variables that lose significance with them. "
+    "Also state any steering in search.steering: locked variables were forced into every model, excluded ones were never tried, "
+    "favored ones were only drawn more often (they still had to earn their place on BIC). "
+    "If batch_learning is present, explain that the search reweighted variables between batches, that learning can chase luck, "
+    "and compare with the luck benchmark (its shuffled runs learned too; shuffled_gains_learning_off shows the same without learning). "
+    "If bootstrap_stability is present, call variables in most resampled winners robust and those in few fragile. "
     "4) What the analyst noticed: weave in the analyst notes, the segments explored (state how many) and any segment findings, "
     "and say group differences found by trying many splits are hypotheses. "
     "5) Limitations and next steps: for each item in health_notes, explain in a sentence why it matters, then give 2 to 3 starter steps "
     "to fix or check it OUTSIDE this app (for example clustered standard errors for panel data, robust standard errors for unequal spread, "
     "inspecting high Cook's distance rows, log or squared terms or splines for curvature, dropping or combining collinear variables). "
-    "Also cover known_app_gaps. "
+    "Also cover known_app_gaps, and any data_audit finding whose decision was 'left as is' or 'flag only'. "
     "6) Pro takeaways: 3 bullets. "
     "Define any statistical term in a few words the first time you use it. "
     "Use only the numbers provided, do not invent facts, and do not choose for the analyst."
@@ -2482,6 +4077,7 @@ REPORT_SYSTEM = (
 def build_report_profile(recipe):
     """Compact JSON for the final report. No raw rows."""
     fm, h = recipe["final_model"], recipe.get("holdout") or {}
+    row = next((r for r in recipe["leaderboard"] if r["Rank"] == fm["rank"]), {})
     prof = {
         "target": recipe["target"],
         "base_model_columns": recipe["base_model_columns"],
@@ -2489,19 +4085,30 @@ def build_report_profile(recipe):
         "selected_model": {k: fm[k] for k in (
             "rank", "variables", "metrics_base", "metrics_best", "changes_from_base",
             "engineered_impact", "runners_up", "line_diagnostics", "health_notes")},
+        "selected_model_cluster_robust": {k: v for k, v in (fm.get("cluster_robust") or {}).items() if k != "table"} or None,
+        "one_standard_error_rule": fm.get("one_se_rule"),
+        "selected_model_search_scores": {k: row.get(k) for k in ("BIC", "BIC Gap", "CV RMSE", "CV RMSE SE")},
         "search": {
             "models_searched": recipe.get("models_searched"), "mode": recipe.get("search_mode"),
+            "ranked_by": recipe.get("search_score"), "cross_validation": recipe.get("cv"),
             "pool": recipe.get("search_pool"), "max_size": recipe.get("search_max_size"),
             "skipped": recipe.get("search_skipped"), "benchmarks": recipe.get("search_benchmarks"),
+            "steering": {"locked": recipe.get("search_locked"), "excluded": recipe.get("search_excluded"),
+                         "draw_weights": recipe.get("search_weights"), "rules": recipe.get("search_rules")},
         },
+        "luck_benchmark": recipe.get("luck_benchmark"),
+        "batch_learning": recipe.get("batch_learning"),
+        "bootstrap_stability": recipe.get("bootstrap_stability"),
         "holdout": {k: h.get(k) for k in ("mode", "entity_column", "fraction", "n_train", "n_holdout", "baseline")},
         "splits_explored": recipe.get("splits_explored", []),
         "segment_findings": recipe.get("segment_findings", {}),
         "analyst_notes": {k: v for k, v in recipe.get("analyst_notes", {}).items() if v.strip()},
         "baseline_claude_read": recipe.get("baseline_claude_read", ""),
         "stage3_health_notes": recipe.get("health_notes", []),
-        "known_app_gaps": [g for g in KNOWN_GAPS
-                           if not g.startswith("Panel data") or recipe.get("dropped_high_cardinality")],
+        "data_audit": audit_lines(recipe.get("audit")),
+        "data_picture_findings": [f"{f['title']} (severity {f['severity']})" for f in recipe.get("data_picture", [])],
+        "candidate_screening": recipe.get("screening_summary"),
+        "known_app_gaps": known_gaps(recipe),
     }
     return json.loads(json.dumps(prof, default=str))
 
@@ -2597,7 +4204,7 @@ def show_stage_6():
     if changes.empty:
         st.info("The selected model uses exactly the base model's variables.")
     else:
-        st.dataframe(changes, use_container_width=True, hide_index=True)
+        st.dataframe(changes, hide_index=True)
         st.caption("Start from the cleaned data, build each Added column with its formula, drop each Removed one, then fit.")
     unused = [step_name(s) for s in plan if step_name(s) and step_name(s) not in win_cols]
     if unused:
@@ -2612,11 +4219,44 @@ def show_stage_6():
         fmt_rows = {}
         for k in bm:
             fmt_rows[k] = [f"{bm[k]:,.0f}", f"{wm[k]:,.0f}"] if k == "Predictors" else [f"{bm[k]:.4f}", f"{wm[k]:.4f}"]
-        st.dataframe(pd.DataFrame(fmt_rows, index=["Base", "Best"]).T, use_container_width=True)
-        st.dataframe(comp.style.format({"Base coef": "{:.4f}", "Base p": "{:.4f}", "Best coef": "{:.4f}", "Best p": "{:.4f}"}, na_rep="-"),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(fmt_rows, index=["Base", "Best"]).T)
+        st.dataframe(comp.style.format({"Base coef": "{:.4f}", "Base p": "{:.4f}", "Best coef": "{:.4f}", "Best p": "{:.4f}"}, na_rep="-"), hide_index=True)
         st.caption("Kept = in both models. Added = only in the best model (often engineered). Removed = in the base model but not the best. "
                    "Coefficients for engineered columns are in the engineered column's own units.")
+
+    # ---- Clustered standard errors (U6) ----
+    ents = entity_candidates(raw)
+    cl_info, cl_tab = None, None
+    if ents:
+        st.divider()
+        ui.section("Standard errors that allow for repeated entities",
+                   "When the same entity (for example a country) appears in many rows, those rows are not independent, so ordinary standard errors are too small. "
+                   "Clustered standard errors fix that. The coefficients do not change; only how sure we can be about them.")
+        default = h["entity_column"] if h["entity_column"] in ents else ents[0]
+        opts = ents + ["Do not cluster"]
+        cl_col = st.selectbox("Cluster by", opts, index=opts.index(default), key=f"cluster_col_{st.session_state.get('pool_version', 0)}")
+        if cl_col != "Do not cluster":
+            cl_tab, n_g = cluster_table(win_m, train.index, raw, cl_col)
+            cl_info = cluster_summary(cl_tab, n_g, cl_col)
+            lost = cl_info["lost_significance"]
+            ui.metric_strip([
+                ("Clusters", f"{n_g:,}", f"Distinct {cl_col} values in the training rows."),
+                ("Median SE ratio", f"{cl_info['median_se_ratio']:.2f}×", "Clustered SE divided by plain SE, across predictors. Above 1 means the plain numbers were overconfident."),
+                ("Significant, plain", f"{cl_info['significant_plain']}", f"Predictors with p below {ALPHA} using ordinary standard errors."),
+                ("Significant, clustered", f"{cl_info['significant_clustered']}", f"Predictors with p below {ALPHA} once repeated {cl_col} rows are allowed for."),
+            ])
+            if lost:
+                st.warning(f"**{len(lost)} predictor(s) lose significance once repeated {cl_col} rows are allowed for:** " + ", ".join(lost)
+                           + ". Their effect may be real, but this data cannot pin it down as firmly as the plain p-values suggest.")
+            elif n_g < 30:
+                st.info(f"Only {n_g} clusters: clustered standard errors are themselves rough with fewer than about 30 groups.")
+            else:
+                st.success("Every predictor that was significant stays significant with clustered standard errors.")
+            with st.expander("Plain vs clustered, every coefficient"):
+                st.dataframe(cl_tab.style.format({c: "{:.4g}" for c in cl_tab.columns})
+                             .background_gradient(subset=["SE ratio"], cmap="Oranges"))
+                st.caption(f"Clustered intervals use a t distribution with {n_g - 1} degrees of freedom (clusters minus 1). "
+                           "The Excel ToolPak tables and the search keep using plain standard errors, so they still match Excel.")
 
     imp = engineered_impact(train, test, y, win_cols, recipe.get("engineered_columns", []),
                             wm["Adjusted R Square"], wm["Holdout R Square"])
@@ -2624,30 +4264,52 @@ def show_stage_6():
         if imp.empty:
             st.info("This model uses no engineered variables.")
         else:
-            st.dataframe(imp.style.format({c: "{:.4f}" for c in imp.columns if c != "Engineered variable"}),
-                         use_container_width=True, hide_index=True)
+            st.dataframe(imp.style.format({c: "{:.4f}" for c in imp.columns if c != "Engineered variable"}), hide_index=True)
             st.caption("Each row refits the model without that one variable. A bigger drop means the variable matters more. A drop near 0 means it adds little, so a simpler model may do just as well.")
 
+    ose = one_se_pick(top)
     wset, rows = set(win_cols), []
-    for r in [r for r in top if r["Rank"] != rank][:3]:
+    others = [r for r in top if r["Rank"] != rank][:3]
+    if ose and ose["rank"] != rank and all(r["Rank"] != ose["rank"] for r in others):
+        others.append(next(r for r in top if r["Rank"] == ose["rank"]))
+    for r in others:
         s = set(r["Variables"].split(", "))
         gap = r["Adjusted R Square"] - sel["Adjusted R Square"]
-        if gap > 0:
+        near = abs(gap) <= NEAR_TIE
+        if ose:
+            if r["Rank"] == ose["rank"]:
+                verdict = "1-SE rule pick: simplest model that predicts as well as the best"
+            elif r["Rank"] in ose["within"]:
+                verdict = "Tied with the best on CV" + (", and simpler" if r["Predictors"] < sel["Predictors"] else "")
+            else:
+                verdict = "Worse on CV (more than one SE behind the best)"
+        elif gap > 0:
             verdict = "Scores higher than the selected model"
         elif gap >= -NEAR_TIE:
             verdict = "Near-tie and simpler: consider it" if r["Predictors"] < sel["Predictors"] else "Near-tie"
         else:
             verdict = "Clearly lower"
-        rows.append({"Rank": r["Rank"], "Adj R Square vs selected": gap, "Predictors": r["Predictors"],
+        rows.append({"Rank": r["Rank"], "Predictors": r["Predictors"], "CV RMSE": r.get("CV RMSE"), "BIC Gap": r.get("BIC Gap"),
+                     "Adj R Square vs selected": gap, "Adj R Square near-tie": "yes" if near else "no",
                      "Holdout R Square": r.get("Holdout R Square"), "Error Ratio": r.get("Error Ratio"),
                      "Only in this model": ", ".join(sorted(s - wset)) or "-",
                      "Only in selected": ", ".join(sorted(wset - s)) or "-", "Verdict": verdict})
     runners = pd.DataFrame(rows)
+    if ose:
+        why = (f"rank {ose['best_rank']} has the lowest CV RMSE ({ose['best_cv_rmse']:.3f}, give or take {ose['best_cv_se']:.3f}), "
+               f"so any model with CV RMSE up to {ose['limit']:.3f} predicts about as well.")
+        if ose["rank"] == rank:
+            st.success(f"**The selected model is the one-standard-error pick:** the simplest model that predicts as well as the best. In detail, {why}")
+        else:
+            st.info(f"**The one-standard-error rule suggests rank {ose['rank']}** ({ose['predictors']} predictors; the selected model has {sel['Predictors']}). "
+                    f"In detail, {why} Simpler models that predict as well usually hold up better on new data. You can pick it in the box at the top.")
     with st.expander("Why not the other top models?"):
         if not runners.empty:
-            st.dataframe(runners.style.format({"Adj R Square vs selected": "{:+.4f}", "Holdout R Square": "{:.4f}", "Error Ratio": "{:.3f}"}, na_rep="-"),
-                         use_container_width=True, hide_index=True)
-        st.caption(f"Near-tie means within {NEAR_TIE} Adjusted R Square. When models are nearly tied, the simpler one is usually the better choice. Holdout numbers are for reporting; do not re-pick by them.")
+            st.dataframe(runners.style.format({"Adj R Square vs selected": "{:+.4f}", "Holdout R Square": "{:.4f}", "Error Ratio": "{:.3f}",
+                                               "CV RMSE": "{:.3f}", "BIC Gap": "{:.1f}"}, na_rep="-"), hide_index=True)
+        st.caption("The main verdict uses the one-standard-error rule on cross-validation: models whose CV RMSE is within one standard error of the best are treated as tied, "
+                   f"and the simplest tied model is suggested. The near-tie column is the older check (within {NEAR_TIE} Adjusted R Square). "
+                   "Holdout numbers are for reporting; do not re-pick by them.")
 
     # ---- LINE checks ----
     st.divider()
@@ -2678,11 +4340,11 @@ def show_stage_6():
     with st.expander("Excel ToolPak tables (selected model)"):
         reg, anova, coef = toolpak_tables(win_m)
         st.markdown("**Regression Statistics**")
-        st.dataframe(reg.style.format("{:,.6f}"), use_container_width=True)
+        st.dataframe(reg.style.format("{:,.6f}"))
         st.markdown("**ANOVA**")
-        st.dataframe(anova.style.format("{:,.6g}", na_rep=""), use_container_width=True)
+        st.dataframe(anova.style.format("{:,.6g}", na_rep=""))
         st.markdown("**Coefficients**")
-        st.dataframe(coef.style.format("{:,.6g}"), use_container_width=True)
+        st.dataframe(coef.style.format("{:,.6g}"))
 
     # ---- Save for the report and export ----
     def records(t):
@@ -2696,7 +4358,7 @@ def show_stage_6():
         "base_vs_best": records(comp), "engineered_impact": records(imp),
         "changes_from_base": records(changes),
         "runners_up": records(runners), "line_diagnostics": {k: float(v) for k, v in diag.items()},
-        "health_notes": notes,
+        "health_notes": notes, "one_se_rule": ose, "cluster_robust": cl_info,
     }
 
     st.divider()
@@ -2768,4 +4430,4 @@ ui.render_header()
 
 # One screen function per stage, in the same order as STAGES.
 STAGE_SCREENS = [show_stage_1, show_stage_2, show_stage_3, show_stage_4, show_stage_5, show_stage_6]
-STAGE_SCREENS[STAGES.index(st.session_state.stage_nav)]()  # the () at the end runs it
+STAGE_SCREENS[STAGES.index(st.session_state.stage_nav)]()  # the () at the end runs it 
