@@ -92,6 +92,12 @@ def first_look_hint():
             st.caption(text)
 
 
+def finding_header(title, severity):
+    """Title of a ranked finding with a severity bar (red from 0.7, amber below)."""
+    st.markdown(f"{':red[●]' if severity >= 0.7 else ':orange[●]'} **{title}**")
+    st.progress(float(severity), text=f"Severity {severity:.2f} of 1")
+
+
 def health_list(notes):
     """Data health notes as calm cards: headline on top, 'why it matters' underneath."""
     if not notes:
@@ -131,7 +137,7 @@ def render_sidebar(stages, has_key):
                 args=(stage,),
                 disabled=i > unlocked,
                 type="primary" if i == current else "secondary",
-                use_container_width=True,
+                width="stretch",
             )
         st.divider()
         st.text_input("Anthropic API key", type="password", key="api_key_box",
